@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/mcp", "crates/eval"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+engine = { path = "crates/engine" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
+thiserror = "2"
+time = "0.3"
+uuid = { version = "1", features = ["v4"] }
