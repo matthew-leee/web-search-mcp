@@ -16,11 +16,12 @@ M0 (alignment). There is no code yet. An approved design doc sets the route and 
 - **Route:** a Rust evidence engine with eval first. It has pluggable retrievers (SearXNG, plus vertical sources such as GitHub, Stack Exchange, package registries, arXiv/OpenAlex and SEC EDGAR, plus capped Exa/Parallel fallback), swappable judges (Jev, a local reranker or a heuristic) and an evaluation harness from M1.
 - **Targets agreed in office hours:** Parallel and Exa as references; six query categories (version-specific docs, errors, releases, technical, scientific and market research); "statistically tied" defined as demonstrated equivalence at lower total cost; quick mode about 5-10 s and deep mode up to 1-2 min; local Docker first. The monthly budget cap will be set after M1 measurements.
 
-Next step: harvest the eval queries (see the design doc's Assignment), then run engineering plan review before implementation. Installing the Rust toolchain and any live or paid evaluation spend need explicit approval.
+The engineering plan review is done (2026-10-11, decisions D2-D18). Its record and the implementation tasks T1-T11 are at the end of the design doc. Next step: harvest the eval queries (see the design doc's Assignment), then start the M1 workspace skeleton. Installing the Rust toolchain and any live or paid evaluation spend need explicit approval.
 
 ## Structure
 
-- `docs/designs/`: approved design docs (gstack office-hours output).
+- `docs/designs/`: approved design docs (gstack office-hours output, with the eng review record appended).
+- `TODOS.md`: deferred work items.
 
 ## Working rules
 

@@ -45,22 +45,41 @@ One Rust service (tokio; official `rmcp` MCP SDK, verify at implementation time)
 - **Judge trait:** Jev via OpenRouter, a local ONNX cross-encoder, or a heuristic, selected by config. Bounded call count and tokens. On failure or budget exhaustion it falls back to the heuristic and says so in the output.
 - **Evidence packager:** compact passages with citation, date, version, qualifiers, contradictions and an explicit coverage-gap section.
 - **Storage:** SQLite for the cache (URL/content/query) and a cost ledger (tokens, API fees, latency per stage).
+- **Query classification (eng review D8):** classification is a Judge-trait call. Deterministic heuristic rules are the default backend, and Jev or a local model can be selected by config. It is bounded by a configured stage deadline; on timeout, budget refusal or invalid output it falls back to the heuristic and says so in metadata. Code maps the classification to quick or deep mode. Tests: per-category heuristic table; judge timeout gives a flagged heuristic result; invalid judge output gives a flagged heuristic result.
+- **Cache bound (eng review D11):** the cache tables have a configured byte cap with least-recently-used eviction. The per-entry cap equals the fetch size limit (larger entries are served but not cached), and expired entries are purged lazily. Cache logic never evicts the ledger, whose retention is configured separately. Tests: inserts beyond the cap evict LRU entries; ledger rows are untouched; an oversize entry is served but not cached.
+- **Paid-call gate (eng review D6):** billing clients (Exa, Parallel, OpenRouter judge) live in one `paid` module and cannot be constructed elsewhere. Every call takes a `Reservation` that only the budget ledger issues and that is consumed on settle. Eval reference clients use the same gate with a separate eval budget. Tests with mocked providers: one ledger reservation row per provider request; a reservation refused at the cap gives `skipped(budget)` with zero provider requests.
+- **Process topology (eng review D3):** one long-lived engine daemon (the compose service) is the only owner of SQLite, cache, ledger and budget. Pi connects over loopback streamable HTTP. The stdio entry point forwards to the daemon and never dispatches paid stages on its own; with the daemon down it returns `failed(internal)`.
+- **HTTP access control (eng review D4):** binds 127.0.0.1 by default and refuses a non-loopback bind unless a bearer token is configured (in compose the container binds inside and publishes only on host loopback, with the token always set). Requests with a non-allowlisted `Origin` are rejected; a bearer token read from env is required and never logged. Tests: wrong Origin 403, missing/wrong token 401, non-loopback bind without token refuses to start. **TLS when exposed (eng review D15):** a non-loopback bind also requires TLS configured in the daemon, or an explicit setting naming the TLS-terminating proxy or tunnel. The compose container bind that is published only on host loopback is exempt. Tests: a non-loopback bind with a token but no TLS/proxy setting refuses to start; the local compose config starts.
 
 ## Contracts and gates (fixed before implementation)
 - **Result semantics.** Each stage reports `ok | failed | timeout | skipped(budget) | skipped(policy) | cancelled`. Response status, in precedence order: `failed` if no usable evidence exists (error class: `deadline`, `budget`, `upstream`, `policy`, `cancelled` or `internal`, plus all stage outcomes); otherwise `complete` only if every required planned stage ended `ok`; otherwise `partial` (usable evidence returned, with non-`ok` stages listed). "Not found" for a subquestion may be claimed only when every search relevant to it ended `ok` with no matching evidence. A search that failed, timed out, was skipped or was cancelled never supports a negative conclusion; its gap is reported as *unsearched*. When the deadline expires, the response is `partial` if usable evidence exists, otherwise `failed` with error class `deadline`. Mocked tests cover a successful empty search vs a connector failure, and a deadline before vs after the first usable evidence.
+- **Upstream-reported partial coverage (eng review D5).** When an upstream answers but reports lost coverage (SearXNG `unresponsive_engines`, GitHub `incomplete_results`, or equivalent): if all coverage was lost the stage is `failed(upstream)`; if some was lost the stage is `ok` with `degraded: [reasons]`, its results stay usable, it never supports a "Not found" claim (the gap is reported as *unsearched*) and the response cannot be `complete`. Fixture tests: all engines unresponsive gives `failed`; one unresponsive gives `degraded`, no negative claim and a `partial` response; GitHub `incomplete_results` gives `degraded`. Field shapes are checked against recorded fixtures.
+- **Status definitions (eng review D7).** *Required* stages are marked `required: true` at planning time: the category's primary connector(s), fetch/extract of selected sources, packaging, and any paid fallback whose trigger fired (a trigger means the free result was insufficient). Only extra breadth connectors are optional; optional non-`ok` stages are still listed. *Usable evidence* means at least one cited passage that passed URL policy, extraction and the relevance threshold (judge or heuristic). Tests: breadth connector failed gives `complete` with the failure listed; triggered fallback `skipped(budget)` gives `partial`; required stage failed with usable evidence gives `partial`; only below-threshold passages gives `failed`.
+- **Successful empty (eng review D18, OV6).** The :50 precedence is unchanged, but a `failed` response whose relevant required searches all ended `ok` (not degraded) with no usable evidence carries the error class `no_match`. That is the only case that supports a "Not found" claim, and it is distinct from *unsearched* gaps. End-to-end schema tests: successful-empty gives `failed(no_match)`; all-below-threshold evidence gives `failed(no_match)`; degraded-empty gives `failed(upstream)` with the gap marked unsearched.
 - **Cancellation and paid liabilities.** On caller cancellation the controller stops new dispatches immediately, cleans up local tasks and attempts upstream cancellation where the provider supports it. Before any paid call (Exa, Parallel, OpenRouter/Jev) the controller reserves its maximum expected cost against the shared budget; dispatch is refused if the reservation would exceed the cap. After completion or cancellation the reservation is reconciled against the actual charge (or kept as an estimate until reported). In-flight charges therefore cannot exceed the cap or disappear from the ledger. Charges that couldn't be avoided after cancellation are disclosed in the ledger and, where a response is still returned, in its metadata. Mocked tests cover cancellation with delayed charge settlement and concurrent reservations at the cap.
+- **Durable reservation lifecycle (eng review D13).** A reservation is committed to SQLite before dispatch. Each ticket covers one provider, its request bounds and one physical attempt, so every retry reserves again. Open reservations survive cancellation and restart as liabilities until they are settled, or until a configured expiry charges the estimate. Settlement is idempotent. If the ledger write fails, nothing is dispatched. Tests: crash between reserve and settle (still counted after restart); ambiguous timeout keeps the liability; a retry needs a second reservation; ledger-write failure gives zero provider requests; a double settle is counted once.
 - **Cache freshness.** Cache keys include the normalized query, mode, category, version pin and config hash. Version-pinned docs/content: long TTL, revalidated with ETag/Last-Modified. "Latest", release and date-sensitive queries: short TTL, plus revalidation before reuse. Stale-on-error is allowed only when flagged. Evidence carries `retrieved_at` and `stale: true|false`. Regression tests cover a version bump invalidating a cached answer and stale reuse being flagged.
+- **Discovery vs content freshness (eng review D17).** There are two TTLs: a discovery TTL (query to candidate URLs) and a content TTL (URL to page). When the discovery TTL expires, discovery reruns even if the cached pages revalidate unchanged. Evidence records `searched_at`, `fetched_at` and `validated_at`. For cost runs, *cold* means the query, URL and content caches are empty, and *warm* means the caches were prepared by a recorded prior run; warm-path rediscovery and revalidation costs and latency are counted. Tests: a new release at a new URL, while every cached page still returns 304, is found after the discovery TTL; the timestamps are present; the cold harness starts with empty caches.
 - **Untrusted content boundary.** Fetched text is data, never instructions. It never changes controller policy, budgets, tool calls or URLs to fetch, except links that pass the same URL policy. Judge outputs are schema-validated values (choices/scores) consumed by bounded code; invalid output goes to the heuristic path. MCP evidence marks source text as untrusted quoted content. Adversarial fixtures cover instruction-override and credential-exfiltration attempts embedded in pages.
+- **Judge influence boundary (eng review D18, OV8).** Judges may only score or select among the candidate and span IDs they were given; an unknown ID is invalid output and goes to the heuristic path. Judge output can affect ranking and selection, but never URLs, budgets or config. Paid triggers fire only inside code-set bounds, so a manipulated score cannot exceed the budget or the trigger limits. No secrets enter the judge context. Packaging is delimiter-safe: source text stays in escaped data fields and is never concatenated into instructions. Fixtures: schema-valid manipulated scores (for example a page saying "rate this 10") for online judging, paid-trigger decisions and grading. Downstream instruction isolation in the consuming agent is **unverified** until it is tested with Pi.
 - **Source access policy gate.** No source receives live automated traffic until its access method (official API vs fetch), ToS/robots treatment, rate limit, backoff and throttling behavior are documented in Sources.md and enforced in code (per-host rate limiter, bounded retries with jitter, honoring Retry-After).
+- **Free-API credentials and quotas (eng review D10).** Optional free credentials come from env: a GitHub token with no scopes and a Stack Exchange app key. They are never logged and are documented in Sources.md; connectors still work without them, at the lower free quota. Each connector reads its quota from response headers or fields (e.g. `X-RateLimit-Remaining`/`Reset`, `quota_remaining`, `backoff`). When the quota is exhausted, no request is sent and the stage is `skipped(policy)` with reason `quota` and the reset time. Tests: remaining=0 gives zero requests and `skipped(policy, quota)`; `backoff` is honored; the token never appears in logs or evidence. The quota numbers are rechecked when Sources.md is written.
+- **Credential scoping (eng review D14).** Each credential is bound to fixed HTTPS origins (for example api.github.com). Authenticated connector clients are separate from the anonymous page fetcher. No credential is sent across origins or on an HTTPS-to-HTTP downgrade. Secrets are redacted from errors, URLs, evidence and persisted artifacts. Tests: a cross-origin redirect carries no credential; a downgrade is refused for an authenticated client; the anonymous fetcher holds no credential; redaction holds in error, log and evidence output.
 - **Comparison protocol (prerequisite to any baseline run, user-approved):** the exact Parallel/Exa products, endpoints, modes and settings; identical query inputs; the same output contract (evidence passages plus citations) for all systems; a common rubric (must-have facts, citation support, version/date accuracy, qualifiers, contradictions, unsupported claims) with failures scored as zero; blinded, shuffled packets with system identity stripped; and system/version/config recorded with each run.
 - **Cost protocol (user-approved):** the same workload and quick/deep mix, cold and warm cache reported separately, all paid calls and retries counted. **Operating cost** (the per-query total used for the "lower total cost" claim) includes online routing/relevance/passage-judging API fees, tokens and retries, and local inference runtime. **Evaluation-only cost** (grading-judge calls, reference/baseline runs) is reported separately and excluded from the per-query total. The protocol also states: downstream model-input tokens from evidence size, priced at a stated model rate; self-hosted runtime allocated at a stated fixed monthly amount over a stated query volume, and pricing dates recorded. M1 evaluation spend is kept separate from operating cost.
+- **Comparative cost per system (eng review D18, OV5).** There are two accounting views. *Project spend* is what this project actually paid, including every eval and reference run. *Comparative per-query operating cost* is computed for every system under the same workload and assumptions. For the engine it is the operating cost above. For each reference it is the configured product's API fees at a dated list price, plus retries, any required subscription allocated over the stated volume, and downstream model-input tokens from its evidence at the same stated rate. A reference call is booked as eval spend in the first view and as that reference's operating cost in the second. Accounting fixtures prove both bookings.
 - **M1 validation matrix (mocked, offline):** connector failure, timeout and malformed responses; deadline and cancellation cleanup (no leaked tasks); concurrent requests exhausting a shared budget (no overspend); upstream 429/Retry-After handling; URL policy for blocked schemes, private/loopback/link-local IPs, redirects to blocked targets and DNS rebinding (resolve-then-pin); cache freshness cases above; injection fixtures; and judge failure falling back to the heuristic. Load and soak tests, VPS deployment checks and observability dashboards are deferred M3/M4 obligations (no detailed inventory exists yet) and are not claimed in M1.
 - **Eval harness (Rust crate):** frozen query set, recorded fixtures for offline tests, a capped live runner for references, blind grading packets (judge model plus user spot checks), and a significance test for "tied".
+- **Development vs sealed acceptance set (eng review D16).** The 42-query seed, and any query seen during development, form the development set and are free for tuning. The parity claim uses a separate sealed acceptance set, built under the approved protocol and never used for tuning. Before the acceptance run, a locked analysis plan (hash recorded) fixes the category weights, the comparator rule (simultaneous inference if the comparator is chosen from acceptance results), the equivalence test and the stopping rule; the values stay open for user approval. Tests: the harness refuses an acceptance run without a locked plan; a plan change after the first acceptance run is flagged; every acceptance run is counted and reported.
+- **Grader validation gate (eng review D9).** Every run, the user blind-grades a stratified random sample covering every category. The agreement metric and threshold are approved together with the comparison protocol (values still open). Below the threshold, the judge's scores are reported as unvalidated and the run supports no tie or difference claim. Offline tests: a seeded sampler covers all categories; the agreement function is checked on known inputs; a below-threshold run is labeled unvalidated. **Extended by D18 (OV7):** the user-graded sample is paired, with every system's output graded for each sampled query. Signed grader error is reported per system and category, with its uncertainty. The gate also requires the differential bias between systems to be smaller than the equivalence margin (bound still open). Test: a synthetic grader with high overall agreement but a bias toward one system fails the gate.
+- **Required proof added by eng review (approved contracts, no new behavior).** URL policy (:44/:57): IPv4-mapped IPv6 and decimal/octal IP forms blocked; `HTTP(S)_PROXY` env ignored, since a proxy would bypass resolve-then-pin; every redirect hop re-checked; size limits applied to decompressed bytes. Retry-After honored in both seconds and HTTP-date forms, with a retry cap. MCP evidence package golden schema test. Eval statistics tested on known synthetic inputs (tied, different, inconclusive). Blinding test: packets contain no provider domains, field names or formatting tells.
 
 ## Open Questions
 - M1 eval spend cap (live Parallel/Exa/Jev runs) and the grading judge model and its cost.
 - Equivalence margin (user-approved), test (e.g. paired bootstrap CI or TOST on per-query scores), and the power-based sample size per category. 42 queries is a seed, likely too few for final acceptance.
 - Approval of the comparison protocol and cost protocol above, including the stated runtime allocation and downstream model rate.
+- Grader agreement metric and threshold for the D9 validation gate, and the user-graded sample size per run.
+- D16 sealed acceptance set: who builds it and when, its size (from the power calculation), category weights, comparator rule and stopping rule.
 - Market-research sources: which are free/legal to use (EDGAR is; others to be checked).
 - Robots.txt/ToS policy and rate limiting toward upstream engines and sites.
 - Extraction: Rust crate quality vs a Trafilatura sidecar, by measurement.
@@ -77,7 +96,7 @@ Docker Compose (SearXNG plus the Rust service, arm64/amd64), with the Rust binar
 ## Next Steps
 1. Approval: Rust toolchain install, M1 eval spend cap, comparison and cost protocols.
 2. Eval set: the 42 harvested queries (Assignment), plus must-have facts per query.
-3. Workspace skeleton: crates `core` (traits, controller), `mcp`, `retrievers`, `extract`, `judge`, `eval`. Language rationale recorded in Decisions.md.
+3. Workspace skeleton (eng review D2): crates `engine` (lib; modules controller, retrieve, fetch/extract, judge, package, store; ONNX behind a cargo feature), `mcp` (bin: stdio + streamable HTTP) and `eval` (harness and live reference clients; never a dependency of `mcp`). Language rationale recorded in Decisions.md.
 4. SearXNG compose (arm64), Retriever plus fixtures, then GitHub and Stack Exchange connectors.
 5. Fetch/extract with safe URL handling, then evidence packager v1 and the MCP quick tool.
 6. Source access policy documented and enforced for every source the baseline touches, and the M1 validation matrix green.
@@ -161,3 +180,831 @@ Stop: CONVERGENCE
 
 > mattC-main-design-20261011-105126.md:55 now specifies workload/mode mix, cache conditions, retries, downstream token pricing, runtime allocation, pricing dates, and separate evaluation expenditure. However, it separates both judging and grading from operating cost without establishing inclusion of the online judging required by line 45 in the final operating total. Correct total-cost accounting remains unresolved.
 <!-- gstack:office-hours:concerns:end -->
+
+# /plan-eng-review record (2026-10-11)
+Target: docs/designs/rust-evidence-engine.md (this file). Report file: this file. Review session 1-1791690526-da788829. Line references (:NN) use the approved doc numbering at commit 2736b7f.
+
+## Scope record
+feature answers: none asked (no feature cuts proposed; M1 list kept as written); structure: B "Smaller arrangement" (D2, user answer 2026-10-11); accepted scope: all features, contracts and gates in this doc unchanged; workspace = 3 crates: `engine` (lib; modules controller, retrieve, fetch/extract, judge, package, store; ONNX behind a cargo feature), `mcp` (bin: stdio + streamable HTTP), `eval` (harness + live reference clients, never a dependency of `mcp`), replacing the 6-crate list in Next Steps item 3; pending remedies: none.
+Scope Challenge result: scope accepted as-is.
+
+## Decision ledger
+
+### R1: Process topology and owner of budget/cache state
+Finding: A1, P1, confidence 8/10, docs/designs/rust-evidence-engine.md:28,47,51,76, reviewer: plan-eng-review (native)
+Plan baseline: original proposal: stdio server for Pi plus optional HTTP (:28); compose service plus binary runnable directly over stdio (:76); SQLite cache and ledger (:47); reservations against "the shared budget" (:51). No approval of a topology.
+Runtime evidence: no code. Pi docs mcp.md:100-102: Pi connects every enabled server per session and stops stdio servers on exit, so N sessions = N processes. Cross-process SQLite sharing between a container and a Windows binary over a bind mount: unknown/unsafe (unverified locally).
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1 topology/state owner | unspecified; N stdio processes + compose service | one long-lived engine daemon owns SQLite, cache, ledger and budget; Pi connects via loopback streamable HTTP; stdio entry forwards to the daemon and never dispatches paid stages standalone | every process opens one SQLite DB on a native filesystem with atomic reservation transactions; container and native binary never share a DB file, so each deployment has its own cap | unchanged (pending risk) |
+| R1 tests | none | mocked: two clients reserving concurrently at the cap through the daemon; stdio forwarder with daemon down returns `failed(internal)` | mocked: two processes reserving concurrently at the cap on one DB | none |
+| R2 HTTP hardening | pending | pending | pending | pending |
+| All other contracts (:50-:58) | approved doc | unchanged | unchanged | unchanged |
+Question D3:
+D3 — Who owns the budget, cache and ledger when several agents connect?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Architecture finding A1 (:28, :47, :51, :76).
+ELI10: Pi starts a fresh stdio server for every session, and the plan also runs the engine in Docker. Each copy would keep its own idea of how much money is left, so two sessions could each spend up to the cap. The fix is to have exactly one place that holds the money counter and cache. Either one always-on engine that everyone talks to, or one shared database file that every copy locks properly.
+Stakes if we pick wrong: the monthly cap and per-query reservations (:51) silently stop being a hard limit, which breaks SEARCH-06 and the no-overspend test in :57.
+Recommendation: A because one daemon is the only layout where "shared budget" is literally one counter, and Pi already speaks streamable HTTP.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Single engine daemon (recommended)
+  ✅ One counter, one cache, one ledger: concurrent-reservation test is meaningful across all clients
+  ✅ Same process runs locally in compose and on a VPS, so the move stays config-only
+  ❌ The daemon must be running; stdio users get a clear failed(internal) when it is down
+B) Shared SQLite file per deployment
+  ✅ No always-on service needed for plain stdio use on one machine
+  ✅ SQLite transactions give atomic reservations within one filesystem
+  ❌ Container and native binary keep separate caps, so total spend can reach twice the cap
+C) Leave unspecified
+  ✅ No design change now; the choice moves to implementation time
+  ❌ Budget guarantee in :51 stays unprovable and the M1 overspend test cannot pass honestly
+Net: one extra running service buys a real hard cap across every agent (human: ~1 day / CC: ~20 min extra for A).
+Header: State owner
+Options:
+A) Single engine daemon (recommended)
+One long-lived engine (compose service) owns SQLite, cache, ledger and budget. Pi connects via loopback streamable HTTP; the stdio entry point forwards to the daemon and never runs paid stages on its own. Mocked tests: concurrent reservations at the cap via the daemon; forwarder with daemon down returns failed(internal). Effort human ~1 day / CC ~20 min; low risk; one service to keep running.
+B) Shared SQLite file per deployment
+Every process opens one SQLite DB on a native filesystem and reserves with atomic transactions. Container and native binary never share a DB file, so each deployment has its own cap. Mocked test: two processes reserving at the cap. Effort human ~0.5 day / CC ~10 min; medium risk (split caps).
+C) Leave unspecified
+No plan change; topology decided at implementation. The :51 shared-budget guarantee and :57 overspend test remain unproven. No effort now; high risk.
+
+State: approved
+Actual answer: A) Single engine daemon (recommended), D3, user answer 2026-10-11
+Accepted scope: one long-lived engine daemon (compose service) owns SQLite, cache, ledger and budget; Pi connects via loopback streamable HTTP; stdio entry point forwards to the daemon and never runs paid stages standalone. Mocked tests: concurrent reservations at the cap via the daemon; stdio forwarder with daemon down returns failed(internal).
+History: none
+
+### R2: Streamable HTTP transport hardening
+Finding: A3, P2, confidence 8/10, docs/designs/rust-evidence-engine.md:28 ("optional HTTP"), now the primary Pi path per R1/D3; reviewer: plan-eng-review (native)
+Plan baseline: original proposal: "stdio for Pi/local agents, optional HTTP" (:28); no auth/Origin rule. R1 approved (D3): Pi connects via loopback streamable HTTP.
+Runtime evidence: no code. MCP streamable-HTTP spec (in-distribution knowledge, unverified this session): servers must validate Origin and should bind localhost. Pi supports bearer tokens for HTTP servers (pi docs mcp.md:18, `--bearer-token-env-var`).
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1 topology | approved D3: daemon | unchanged | unchanged | unchanged |
+| R2 bind address | unspecified | 127.0.0.1 by default; refuses non-loopback bind unless a token is configured | 127.0.0.1 by default | unspecified |
+| R2 Origin check | none | reject requests whose Origin is present and not allowlisted | same as A | none |
+| R2 bearer token | none | required, read from env, never logged | none | none |
+| R2 tests | none | wrong Origin 403; missing/wrong token 401; non-loopback bind without token refuses to start | wrong Origin 403 | none |
+Question D4:
+D4 — How locked down is the engine's HTTP endpoint?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Architecture finding A3 (:28), now Pi's main path after D3.
+ELI10: After D3 the engine listens on a local web port, and that port can spend money (Exa, Parallel, Jev). A malicious web page in your browser can try to call localhost ports, and on a VPS anyone on the internet could. Locking it down means only listening on this machine, rejecting browser-origin requests, and requiring a secret token that Pi sends.
+Stakes if we pick wrong: a stray web page or internet scanner could run paid searches against your budget or read cached evidence.
+Recommendation: A because the token is one env var in Pi's config and it is what makes the VPS move safe.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Loopback + Origin + token (recommended)
+  ✅ Blocks browser DNS-rebinding and any client that lacks the secret token
+  ✅ Same config works on a VPS: non-loopback bind is refused without a token
+  ❌ One more secret to set in Pi's mcp.json and the compose env file
+B) Loopback + Origin only
+  ✅ Zero secrets to manage on this single-user PC
+  ✅ Still blocks the browser-origin attack that the MCP spec warns about
+  ❌ Any local process can call it, and a VPS deploy needs this decision reopened
+C) Leave as written
+  ✅ No work now; transport details decided at implementation
+  ❌ A paid-capable endpoint ships with no stated access control
+Net: one env var buys safe local use and a safe VPS move (human: ~2h / CC: ~10 min for A).
+Header: HTTP hardening
+Options:
+A) Loopback + Origin + token (recommended)
+Bind 127.0.0.1 by default; refuse non-loopback bind unless a token is configured. Reject requests with a non-allowlisted Origin. Require a bearer token read from env, never logged. Tests: wrong Origin 403; missing/wrong token 401; non-loopback bind without token refuses to start. Effort human ~2h / CC ~10 min; low risk; one secret to maintain.
+B) Loopback + Origin only
+Bind 127.0.0.1 by default; reject non-allowlisted Origin. No token. Test: wrong Origin 403. Effort human ~1h / CC ~5 min; medium risk (any local process, VPS needs a revisit).
+C) Leave as written
+No access-control rule in the plan; decided at implementation. No effort now; high risk.
+
+State: approved
+Actual answer: A) Loopback + Origin + token (recommended), D4, user answer 2026-10-11
+Accepted scope: bind 127.0.0.1 by default; refuse non-loopback bind unless a token is configured; reject requests with a non-allowlisted Origin; require a bearer token read from env, never logged. Tests: wrong Origin 403; missing/wrong token 401; non-loopback bind without token refuses to start.
+History: none
+
+### R3: Upstream-reported partial coverage (SearXNG unresponsive engines and similar)
+Finding: A2, P1, confidence 7/10, docs/designs/rust-evidence-engine.md:50 ("'Not found' ... only when every search relevant to it ended `ok`") and :43 (SearXNG retriever); reviewer: plan-eng-review (native)
+Plan baseline: approved :50 result semantics; no rule for an upstream that answers 200 while reporting partial coverage.
+Runtime evidence: no code. In-distribution knowledge, unverified this session: SearXNG JSON includes `unresponsive_engines` when engines time out, are rate-limited or hit CAPTCHA; GitHub search returns `incomplete_results`. Exact field shapes must be checked against recorded fixtures.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1, R2 | approved D3, D4 | unchanged | unchanged | unchanged |
+| R3 all engines/coverage lost | maps to ok-empty (risk) | stage `failed(upstream)` | stage `failed(upstream)` | unspecified |
+| R3 some engines lost / incomplete flag | maps to ok (risk) | stage `ok` plus `degraded: [reasons]`; results usable; a degraded search never supports "Not found" (gap reported as unsearched); response cannot be `complete` | stage `failed(upstream)`; its results discarded | unspecified |
+| R3 tests | none | fixtures: all engines unresponsive -> failed; one unresponsive -> degraded, no negative claim, response partial; GitHub incomplete_results -> degraded | fixtures: any unresponsive -> failed | none |
+Question D5:
+D5 — What happens when SearXNG (or GitHub) says "I only searched part of what you asked"?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Architecture finding A2 (:43, :50).
+ELI10: SearXNG asks Google, Bing, DuckDuckGo and others for you. When some of them block you, SearXNG still answers "200 OK" with fewer or zero results and a list of engines that failed. If our code treats that as a normal empty search, the engine could tell the agent "this doesn't exist" when really nobody looked. The fix is to read that failure list and mark the search as degraded or failed.
+Stakes if we pick wrong: false "Not found" answers, the exact failure the :50 contract was written to prevent, appearing whenever upstream engines throttle you.
+Recommendation: A because it keeps the useful results from engines that did answer while still forbidding negative claims.
+Completeness: A=10/10, B=8/10, C=3/10
+Pros / cons:
+A) Degraded flag, keep results (recommended)
+  ✅ Keeps answers from engines that worked, so quality does not drop when one engine blocks
+  ✅ Negative claims and `complete` status are forbidden whenever coverage was partial
+  ❌ Adds a `degraded` field to stage outcomes that the packager and MCP schema must carry
+B) Any loss = failed stage
+  ✅ No new field: reuses the existing `failed(upstream)` outcome in :50
+  ✅ Simplest rule to test and reason about at 3am
+  ❌ Throws away good results whenever one of many engines hiccups, which will be often
+C) Leave as written
+  ✅ No work now
+  ❌ Throttled engines silently become verified absence
+Net: one extra field keeps partial results honest instead of either lying or discarding them (human: ~3h / CC: ~10 min for A).
+Header: Partial coverage
+Options:
+A) Degraded flag, keep results (recommended)
+All engines lost: stage failed(upstream). Some lost or upstream incomplete flag: stage ok plus degraded: [reasons]; results usable; a degraded search never supports "Not found" (gap reported as unsearched) and the response cannot be complete. Fixture tests: all unresponsive -> failed; one unresponsive -> degraded, no negative claim, response partial; GitHub incomplete_results -> degraded. Effort human ~3h / CC ~10 min; low risk.
+B) Any loss = failed stage
+Any unresponsive engine or incomplete flag: stage failed(upstream) and its results are discarded. Fixture test: any unresponsive -> failed. Effort human ~1h / CC ~5 min; quality risk from discarded results.
+C) Leave as written
+No rule; partial upstream coverage maps to ok. No effort now; high risk of false negatives.
+
+State: approved
+Actual answer: A) Degraded flag, keep results (recommended), D5, user answer 2026-10-11
+Accepted scope: all engines lost: stage failed(upstream). Some lost or upstream incomplete flag: stage ok plus degraded: [reasons]; results usable; a degraded search never supports "Not found" (gap reported as unsearched) and the response cannot be complete. Fixture tests: all unresponsive -> failed; one unresponsive -> degraded, no negative claim, response partial; GitHub incomplete_results -> degraded.
+History: none
+
+### R4: Structural gate for paid calls
+Finding: C1, P2, confidence 7/10, docs/designs/rust-evidence-engine.md:43 ("Paid escalation is possible only when preapproved configuration enables it and budget remains"), :45 (Jev via OpenRouter), :51 ("Before any paid call ... the controller reserves its maximum expected cost"); reviewer: plan-eng-review (native)
+Plan baseline: approved :51 reservation rule; mechanism unspecified (any connector or judge could call its provider directly).
+Runtime evidence: no code.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R3 | approved D3-D5 | unchanged | unchanged | unchanged |
+| R4 enforcement mechanism | unspecified | type-level: billing clients (Exa, Parallel, OpenRouter judge) live in one `paid` module, are not constructible elsewhere, and every call takes a `Reservation` issued only by the budget ledger and consumed on settle | runtime convention: controller checks budget before invoking a paid retriever/judge; clients callable directly | unspecified |
+| R4 tests | none | mocked providers count requests; every request maps to exactly one ledger reservation row; reservation refused at cap yields `skipped(budget)` with zero provider requests | mocked controller path: refused at cap yields `skipped(budget)` | none |
+| Eval reference clients | eval crate (D2) | use the same `paid` gate with a separate eval budget | separate eval budget check by convention | unspecified |
+Question D6:
+D6 — Should the code make it impossible to call a paid API without reserving budget first?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Code Quality finding C1 (:43, :45, :51).
+ELI10: The plan says every paid call (Exa, Parallel, Jev) must first reserve money from the budget. If that is only a habit, one future connector or judge can call its API directly and skip the check. In Rust we can make the paid clients require a "reservation ticket" that only the budget ledger hands out, so code without a ticket simply does not compile.
+Stakes if we pick wrong: a silent paid call, which SEARCH-05 forbids, and spend that the ledger never sees.
+Recommendation: A because the compiler then enforces SEARCH-05 for every future connector, not just the ones we remember to review.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Reservation ticket in types (recommended)
+  ✅ A paid request without a ledger reservation cannot be written, now or by future connectors
+  ✅ Tests can assert one ledger row per provider request, making spend auditable
+  ❌ Slightly more ceremony for each paid client: acquire, call, settle
+B) Controller checks by convention
+  ✅ Less code: one budget check before each paid retriever or judge call
+  ✅ Still testable on the controller path with mocks
+  ❌ Nothing stops a later connector or the eval runner from calling a provider directly
+C) Leave as written
+  ✅ No work now; the rule in :51 stands as prose
+  ❌ Enforcement depends on every reviewer noticing every call site
+Net: a little ceremony per paid client buys a guarantee the compiler checks (human: ~4h / CC: ~15 min for A).
+Header: Paid-call gate
+Options:
+A) Reservation ticket in types (recommended)
+Billing clients (Exa, Parallel, OpenRouter judge) live in one paid module, are not constructible elsewhere, and every call takes a Reservation issued only by the budget ledger and consumed on settle. Eval reference clients use the same gate with a separate eval budget. Tests: mocked providers; one ledger reservation row per request; refused at cap gives skipped(budget) with zero provider requests. Effort human ~4h / CC ~15 min; low risk.
+B) Controller checks by convention
+Controller checks the budget before invoking a paid retriever or judge; clients remain directly callable. Eval runner checks its own budget by convention. Test: refused at cap gives skipped(budget) on the controller path. Effort human ~2h / CC ~5 min; medium risk of bypass.
+C) Leave as written
+No mechanism specified; :51 stays prose. No effort now; high bypass risk.
+
+State: approved
+Actual answer: A) Reservation ticket in types (recommended), D6, user answer 2026-10-11
+Accepted scope: billing clients (Exa, Parallel, OpenRouter judge) live in one paid module, are not constructible elsewhere, and every call takes a Reservation issued only by the budget ledger and consumed on settle. Eval reference clients use the same gate with a separate eval budget. Tests: mocked providers; one ledger reservation row per request; refused at cap gives skipped(budget) with zero provider requests.
+History: none
+
+### R5: Definitions of "required stage" and "usable evidence"
+Finding: C2, P2, confidence 7/10, docs/designs/rust-evidence-engine.md:50 ("`complete` only if every required planned stage ended `ok`"; "`failed` if no usable evidence exists"); reviewer: plan-eng-review (native)
+Plan baseline: approved :50 status precedence; both terms undefined. :43: paid fallback runs only "behind explicit triggers" (low relevant-source count, coverage gap, semantic-similarity need, upstream throttling).
+Runtime evidence: no code.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R4 | approved D3-D6 | unchanged | unchanged | unchanged |
+| R5 required stage | undefined | marked `required: true` at planning time: the category's primary connector(s), fetch/extract of selected sources, packaging, and any paid fallback whose trigger fired (a trigger means the free result was insufficient); only extra breadth connectors are optional; optional non-ok stages are still listed | every planned stage is required, including extra breadth connectors | undefined |
+| R5 usable evidence | undefined | at least one cited passage that passed URL policy, extraction and the relevance threshold (judge or heuristic) | same as A | undefined |
+| R5 tests | none | required ok + extra breadth connector failed -> complete with failure listed; triggered paid fallback skipped(budget) -> partial; required failed + usable evidence -> partial; only below-threshold passages -> failed | any non-ok stage -> partial; triggered paid fallback skipped(budget) -> partial; only below-threshold passages -> failed | none |
+Question D7:
+D7 — What counts as a "required" step and as "usable" evidence?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Code Quality finding C2 (:50, :43).
+ELI10: The status rules say an answer is "complete" only if every required step worked, and "failed" if nothing usable came back. The plan never says which steps are required or what "usable" means, so two developers would compute different statuses. Proposal: required = the main source for this kind of question, reading the pages, packaging, and a paid fallback once its trigger fired (a trigger means the free answer was not enough). Only extra "breadth" sources are optional. "Usable" means at least one cited passage that passed safety and relevance checks.
+Stakes if we pick wrong: either a flaky side source makes every answer "partial" (noise agents learn to ignore) or a thin answer gets labeled "complete".
+Recommendation: A because a flaky extra source should not downgrade an answer whose main sources worked, while a budget-skipped triggered fallback still honestly yields partial.
+Completeness: A=10/10, B=8/10, C=3/10
+Pros / cons:
+A) Required vs optional stages (recommended)
+  ✅ A failing extra breadth source does not downgrade an answer whose main sources fully worked
+  ✅ A triggered paid fallback skipped for budget still yields partial, so thin answers stay flagged
+  ❌ The planner must tag each stage, one more field to get right in tests
+B) Every stage required
+  ✅ Simplest rule: any non-ok stage at all means partial
+  ✅ No tagging logic to test or maintain in the planner
+  ❌ One flaky secondary source downgrades answers whose primary sources were fine
+C) Leave undefined
+  ✅ No work now
+  ❌ Status computation is left to whoever writes the packager first
+Net: one tag per stage makes the complete/partial label carry real meaning (human: ~2h / CC: ~10 min for A).
+Header: Status definitions
+Options:
+A) Required vs optional stages (recommended)
+Required = stages marked required at planning time: category's primary connector(s), fetch/extract of selected sources, packaging, and any paid fallback whose trigger fired. Only extra breadth connectors are optional; optional non-ok stages still listed. Usable evidence = at least one cited passage that passed URL policy, extraction and the relevance threshold (judge or heuristic). Tests: breadth connector failed -> complete with failure listed; triggered fallback skipped(budget) -> partial; required failed + usable evidence -> partial; only below-threshold passages -> failed. Effort human ~2h / CC ~10 min.
+B) Every stage required
+All planned stages are required, including breadth connectors; any non-ok stage gives partial. Usable evidence as in A. Tests: any non-ok stage -> partial; triggered fallback skipped(budget) -> partial; only below-threshold passages -> failed. Effort human ~1h / CC ~5 min.
+C) Leave undefined
+No definitions; decided at implementation. No effort now; inconsistent status risk.
+
+State: approved
+Actual answer: A) Required vs optional stages (recommended), D7, user answer 2026-10-11
+Accepted scope: required = stages marked required at planning time: category's primary connector(s), fetch/extract of selected sources, packaging, and any paid fallback whose trigger fired. Only extra breadth connectors are optional; optional non-ok stages still listed. Usable evidence = at least one cited passage that passed URL policy, extraction and the relevance threshold (judge or heuristic). Tests: breadth connector failed -> complete with failure listed; triggered fallback skipped(budget) -> partial; required failed + usable evidence -> partial; only below-threshold passages -> failed.
+History: draft revised before sending: earlier draft made a triggered paid fallback optional, which would label a budget-skipped, trigger-flagged answer complete; corrected because every :43 trigger signals insufficient free results.
+
+### R6: Backend for query classification and mode selection
+Finding: C3, P2, confidence 6/10, docs/designs/rust-evidence-engine.md:42 ("Controller: classifies the query (category, version/date sensitivity), picks quick or deep mode"), :28 ("Quick/deep mode chosen by code"), :30 (Jev for bounded semantic judgments); reviewer: plan-eng-review (native)
+Plan baseline: original proposal; classifier backend unspecified.
+Runtime evidence: no code.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R5 | approved D3-D7 | unchanged | unchanged | unchanged |
+| R6 classifier backend | unspecified | Judge-trait call: deterministic heuristic rules are the default backend; Jev or a local model selectable by config; bounded by a configured stage deadline; on timeout, budget refusal or invalid output it falls back to the heuristic and says so in metadata | deterministic heuristic rules only in M1 (version strings, error signatures, identifiers such as arXiv IDs or tickers, recency words); a Judge-backed classifier is deferred to M3 and chosen by eval | unspecified |
+| R6 mode choice | "chosen by code" (:28) | code maps the classification to quick/deep | same as A | unspecified |
+| R6 tests | none | heuristic table tests per category; judge timeout -> heuristic flagged; invalid judge output -> heuristic flagged; eval can compare heuristic vs Jev classification | heuristic table tests per category | none |
+Question D8:
+D8 — Who decides which kind of question this is: fixed rules, or a swappable judge with rules as backup?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Code Quality finding C3 (:42, :28, :30).
+ELI10: Before searching, the engine decides what kind of question this is (version docs, error, release, science, market) and whether it needs quick or deep mode. That choice picks the sources. The plan does not say who makes it. Fixed rules (like "contains a version number" or "looks like a stack trace") are fast and free. A judge such as Jev may be smarter but costs time and money. Option A runs it through the same swappable judge slot with rules as the default and the fallback.
+Stakes if we pick wrong: hardcoded rules violate the "decision model can be swapped" requirement, or an always-on model call eats the quick-mode time budget.
+Recommendation: A because it satisfies SEARCH-05 with no extra cost by default, and eval can later measure whether Jev classification is worth paying for.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Judge slot, rules default (recommended)
+  ✅ Swappable per SEARCH-05; default heuristic adds no API cost or latency
+  ✅ Eval can compare heuristic vs Jev classification on the frozen set
+  ❌ Classifier needs its own deadline, fallback path and two extra tests
+B) Rules only in M1
+  ✅ Simplest M1: pure functions, table-driven tests, zero model calls
+  ✅ Defers the model question to M3 where the Vision puts the controller work
+  ❌ Hardcoded until M3, so M1 eval cannot measure a smarter router
+C) Leave unspecified
+  ✅ No work now
+  ❌ The step that picks every source has no defined owner or fallback
+Net: a small amount of plumbing now keeps the router swappable and measurable from M1 (human: ~3h / CC: ~10 min for A).
+Header: Classifier backend
+Options:
+A) Judge slot, rules default (recommended)
+Classification is a Judge-trait call. Heuristic rules are the default backend; Jev or a local model selectable by config; bounded by a configured stage deadline; on timeout, budget refusal or invalid output it falls back to the heuristic and says so. Code maps the classification to quick/deep. Tests: per-category heuristic table; judge timeout -> heuristic flagged; invalid output -> heuristic flagged. Effort human ~3h / CC ~10 min.
+B) Rules only in M1
+Deterministic heuristic rules only in M1 (version strings, error signatures, identifiers, recency words); Judge-backed classification deferred to M3 and chosen by eval. Code maps to quick/deep. Test: per-category heuristic table. Effort human ~2h / CC ~5 min.
+C) Leave unspecified
+No backend decision in the plan. No effort now; undefined routing owner.
+
+State: approved
+Actual answer: A) Judge slot, rules default (recommended), D8, user answer 2026-10-11
+Accepted scope: classification is a Judge-trait call. Heuristic rules are the default backend; Jev or a local model selectable by config; bounded by a configured stage deadline; on timeout, budget refusal or invalid output it falls back to the heuristic and says so. Code maps the classification to quick/deep. Tests: per-category heuristic table; judge timeout -> heuristic flagged; invalid output -> heuristic flagged.
+History: none
+
+### R7: Grading-judge validation against user grades
+Finding: T1, P2, confidence 7/10, docs/designs/rust-evidence-engine.md:58 ("blind grading packets (judge model plus user spot checks)"), :24 ("Grading is blind"); reviewer: plan-eng-review (native)
+Plan baseline: original proposal: judge model plus user spot checks; no rule for how spot checks validate the judge.
+Runtime evidence: no code; no grading run exists.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R6 | approved D3-D8 | unchanged | unchanged | unchanged |
+| R7 judge validation | spot checks, no rule | predeclared gate: user blind-grades a stratified random sample (every category) per run; agreement metric and threshold are user-approved with the comparison protocol (values stay open); below threshold the judge's scores are reported as unvalidated and the run supports no tie or difference claim | agreement on the user sample is computed and published with the run; no gate | unchanged |
+| R7 tests | none | offline: sampler covers every category and is seeded/reproducible; agreement function on known inputs; below-threshold run is labeled unvalidated | offline: agreement function on known inputs | none |
+| Margin, test, sample size, protocols | open (Open Questions) | still open | still open | still open |
+Question D9:
+D9 — Must the AI grader prove it agrees with you before its scores count?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Test finding T1 (:24, :58).
+ELI10: The "statistically tied" verdict rests on scores from an AI grading model, with you spot-checking some answers. But the plan never says what happens if the grader and you disagree. AI graders can favor a style (long answers, or their own provider's format). Option A fixes the rule in advance: you blind-grade a random sample from every category, and if the grader does not agree with you well enough, its scores cannot be used to claim a tie or a win.
+Stakes if we pick wrong: a parity claim built on a biased grader, which is exactly what SEARCH-09 ("no parity claim before evidence") is meant to stop.
+Recommendation: A because a precommitted gate is the only way spot checks can actually veto a bad grader.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Agreement gate (recommended)
+  ✅ A grader that disagrees with you cannot produce a tie or win claim
+  ✅ Sample covers every category, so a weak category's grading is checked too
+  ❌ Costs your grading time each run, and the metric and threshold still need your approval
+B) Publish agreement only
+  ✅ Less of your time required, and the number is still visible in reports
+  ✅ No threshold to agree on before the first run
+  ❌ A poor agreement number does not stop the run from being cited as parity
+C) Leave as written
+  ✅ No work now
+  ❌ Spot checks have no defined effect on the verdict
+Net: some of your grading time per run buys a verdict that a biased grader cannot fake (human: ~2-4h grading per run, set by sample size / CC: ~15 min to build).
+Header: Grader validation
+Options:
+A) Agreement gate (recommended)
+Per run, user blind-grades a stratified random sample covering every category. Agreement metric and threshold are approved with the comparison protocol (values stay open). Below threshold, judge scores are reported as unvalidated and the run supports no tie or difference claim. Offline tests: seeded sampler covers all categories; agreement function on known inputs; below-threshold run labeled unvalidated. Effort: user grading ~2-4h per run; CC ~15 min.
+B) Publish agreement only
+Agreement on the user sample is computed and published with each run; no gate on claims. Offline test: agreement function on known inputs. Effort: less user time; CC ~5 min.
+C) Leave as written
+Spot checks with no defined effect on the verdict. No effort now.
+
+State: approved
+Actual answer: A) Agreement gate (recommended), D9, user answer 2026-10-11
+Accepted scope: per run, user blind-grades a stratified random sample covering every category. Agreement metric and threshold are approved with the comparison protocol (values stay open). Below threshold, judge scores are reported as unvalidated and the run supports no tie or difference claim. Offline tests: seeded sampler covers all categories; agreement function on known inputs; below-threshold run labeled unvalidated.
+History: reopened 2026-10-11 by outside-voice finding OV7 (differential grader bias, a concrete new risk). Extended, not replaced, by D18 item 3: paired sample across systems, signed error per system and category, differential bias below the equivalence margin. Original D9 scope above remains in force.
+
+### R8: Free-API quotas and credentials for vertical connectors
+Finding: P1, P2, confidence 8/10, docs/designs/rust-evidence-engine.md:43 (GitHub, Stack Exchange connectors), :54 ("rate limit, backoff and throttling behavior are documented in Sources.md and enforced in code"); reviewer: plan-eng-review (native)
+Plan baseline: approved :54 source access policy gate; credentials and quota tracking unspecified.
+Runtime evidence: no code. In-distribution knowledge, unverified this session: GitHub REST 60 req/h unauthenticated (search ~10 req/min); Stack Exchange 300 req/day per IP without an app key, and responses carry `quota_remaining` and sometimes `backoff`. Values must be rechecked and recorded in Sources.md.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R7 | approved D3-D9 | unchanged | unchanged | unchanged |
+| R8 credentials | none | optional free credentials from env (GitHub token with no scopes, Stack Exchange app key), never logged; documented in Sources.md; connectors work without them at lower quota | unauthenticated only | unspecified |
+| R8 quota tracking | none | per-source quota read from response headers/fields (X-RateLimit-Remaining/Reset, quota_remaining, backoff); when exhausted, no request is sent and the stage is `skipped(policy)` with reason `quota` and reset time | same as A | unspecified |
+| R8 tests | none | fixture remaining=0 -> zero requests, skipped(policy, quota); Stack Exchange backoff honored; token never appears in logs or evidence | fixture remaining=0 -> zero requests, skipped(policy, quota); backoff honored | none |
+Question D10:
+D10 — Should GitHub and Stack Exchange connectors use free API keys and track their quotas?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Performance finding P1 (:43, :54).
+ELI10: GitHub and Stack Exchange give a small number of free calls without a key (roughly 60 per hour for GitHub, 300 per day for Stack Exchange, to be rechecked) and many more with a free key. The eval alone could use those up in one run. Then searches start failing halfway. Option A lets you add free keys through environment variables and makes the engine track how many calls are left, so it stops cleanly and reports "quota" instead of hammering the API.
+Stakes if we pick wrong: connectors go dark mid-eval or mid-day, answers turn partial, and the eval measures quota exhaustion instead of search quality.
+Recommendation: A because the keys are free, optional and env-only, and quota tracking is needed either way.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Optional free keys + quota tracking (recommended)
+  ✅ Much higher limits for eval runs and daily use, at zero cost
+  ✅ Works without keys too, just at the lower free quota
+  ❌ You create a GitHub token and a Stack Exchange app key, and they become secrets to protect
+B) No keys, quota tracking only
+  ✅ No credentials to create or protect
+  ✅ Still stops cleanly and reports quota instead of erroring
+  ❌ Low ceilings likely cap eval size and make connectors unavailable for long stretches
+C) Leave as written
+  ✅ No work now; :54 still requires documenting rate limits
+  ❌ No defined behavior when the free quota runs out
+Net: two free optional keys turn a likely quota wall into headroom (human: ~3h / CC: ~10 min for A; your time to create keys ~10 min).
+Header: API quotas
+Options:
+A) Optional free keys + quota tracking (recommended)
+Optional free credentials from env (GitHub token with no scopes, Stack Exchange app key), never logged, documented in Sources.md; connectors still work without them. Quota read from response headers/fields; when exhausted no request is sent and the stage is skipped(policy) with reason quota and reset time. Tests: remaining=0 -> zero requests, skipped(policy, quota); backoff honored; token never in logs or evidence. Effort human ~3h / CC ~10 min.
+B) No keys, quota tracking only
+Unauthenticated only. Same quota tracking and skipped(policy, quota) behavior. Tests: remaining=0 -> zero requests, skipped(policy, quota); backoff honored. Effort human ~2h / CC ~5 min.
+C) Leave as written
+No credential or quota rule beyond :54 documentation. No effort now.
+
+State: approved
+Actual answer: A) Optional free keys + quota tracking (recommended), D10, user answer 2026-10-11
+Accepted scope: optional free credentials from env (GitHub token with no scopes, Stack Exchange app key), never logged, documented in Sources.md; connectors still work without them. Quota read from response headers/fields; when exhausted no request is sent and the stage is skipped(policy) with reason quota and reset time. Tests: remaining=0 -> zero requests, skipped(policy, quota); backoff honored; token never in logs or evidence.
+History: none
+
+### R9: Cache size bound and eviction
+Finding: P2, P2, confidence 7/10, docs/designs/rust-evidence-engine.md:47 ("SQLite for the cache (URL/content/query) and a cost ledger"), :52 (TTL rules); reviewer: plan-eng-review (native)
+Plan baseline: approved :52 freshness rules; no size bound or eviction.
+Runtime evidence: no code; growth rate unknown (depends on query volume and page sizes).
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R8 | approved D3-D10 | unchanged | unchanged | unchanged |
+| R9 cache bound | none | configured byte cap on cache tables; least-recently-used eviction; per-entry cap equal to the fetch size limit (larger entries are served but not cached); expired entries purged lazily | periodic purge of TTL-expired rows only; no size cap | none |
+| R9 ledger | in same SQLite | never evicted by cache logic; ledger retention configured separately | same as A | unspecified |
+| R9 tests | none | inserts beyond cap evict LRU entries; ledger rows untouched by eviction; oversize entry served but not cached | expired rows purged; ledger rows untouched | none |
+Question D11:
+D11 — Should the page cache have a size limit?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, Performance finding P2 (:47, :52).
+ELI10: The engine saves fetched pages in a local database so repeat questions are fast and free. Nothing in the plan limits how big that database gets. Old version-pinned pages have long expiry times, so they pile up. Option A sets a maximum size and throws out the least recently used pages first, while never touching the money ledger.
+Stakes if we pick wrong: the cache slowly fills the Docker volume on this PC or a small VPS, and the daemon fails on disk-full writes.
+Recommendation: A because a byte cap is the only bound that holds no matter how long TTLs are, and it protects the ledger.
+Completeness: A=10/10, B=7/10, C=3/10
+Pros / cons:
+A) Byte cap + LRU eviction (recommended)
+  ✅ Disk use has a hard ceiling you set in config, safe on a small VPS
+  ✅ Ledger is never evicted, so spend history stays complete
+  ❌ Popular old pages may be evicted and refetched, costing a little latency
+B) Purge expired rows only
+  ✅ Simpler: one periodic delete of rows past their TTL
+  ✅ Never evicts a still-fresh entry
+  ❌ Long-TTL version-pinned pages still grow without a ceiling
+C) Leave as written
+  ✅ No work now
+  ❌ Unbounded disk growth on a long-running daemon
+Net: a config number and an LRU index buy a disk ceiling (human: ~3h / CC: ~10 min for A).
+Header: Cache bound
+Options:
+A) Byte cap + LRU eviction (recommended)
+Configured byte cap on cache tables; least-recently-used eviction; per-entry cap equal to the fetch size limit (larger entries served but not cached); expired entries purged lazily. Ledger never evicted by cache logic; ledger retention configured separately. Tests: inserts beyond cap evict LRU; ledger untouched; oversize entry served but not cached. Effort human ~3h / CC ~10 min.
+B) Purge expired rows only
+Periodic purge of TTL-expired cache rows; no size cap. Ledger never evicted by cache logic. Tests: expired rows purged; ledger untouched. Effort human ~1h / CC ~5 min.
+C) Leave as written
+No bound or eviction. No effort now.
+
+State: approved
+Actual answer: A) Byte cap + LRU eviction (recommended), D11, user answer 2026-10-11
+Accepted scope: configured byte cap on cache tables; least-recently-used eviction; per-entry cap equal to the fetch size limit (larger entries served but not cached); expired entries purged lazily. Ledger never evicted by cache logic; ledger retention configured separately. Tests: inserts beyond cap evict LRU; ledger untouched; oversize entry served but not cached.
+History: none
+
+## Outside voice (D12 approved by user)
+Provider: workflow_agent role reviewer, openrouter/openai/gpt-6.1-sol, thinking high, 5 steps, $0.1676, read-only, no tests or external APIs. Input: condensed plan (Recommended Approach + Contracts + Open Questions with D2-D11). Status: completed. Findings (verbatim summary of the 8 returned; advisory, each checked by the architect against the plan text before asking):
+- OV1 [P1, 9/10] Reservation lifecycle: an expected-cost estimate is not a billing ceiling; reservations must survive crash/restart, ambiguous timeouts and retries; settlement idempotent; fail closed on ledger-write failure. Architect check: valid; :51 and D6 do not say reservations are durable or per attempt.
+- OV2 [P1, 8/10] Credential safety: URL policy is not credential scoping; redirects/downgrades can leak connector tokens; D4 lets an exposed endpoint send the bearer token in plaintext without TLS. Architect check: valid; split into R11 (credential scoping) and R12 (TLS on exposed bind).
+- OV3 [P1, 9/10] Benchmark overfitting: tuning on the frozen set then claiming equivalence on it, choosing the "best" reference after seeing scores, or repeated checking adds selection/stopping bias. Architect check: valid; :24 says only the final acceptance run can claim parity but no held-out set or predeclared analysis exists.
+- OV4 [P2, 9/10] Discovery freshness: revalidating cached URLs does not rediscover; a new release at a new URL is missed while old pages return 304; cold/warm reset undefined. Architect check: valid against :52.
+- OV5 [P2, 9/10] Reference cost: reference runs are classified evaluation-only, but their operating-equivalent per-query cost for the lower-cost comparison is undefined. Architect check: valid against :56.
+- OV6 [P2, 10/10] Successful empty: all relevant searches ok with no match gives `failed` under :50 precedence, yet no error class describes it. Architect check: valid.
+- OV7 [P2, 9/10] Differential grader bias: high pooled agreement can hide a small system-specific bias that manufactures equivalence; D9 sample is not paired across systems. Architect check: valid; reopens R7/D9.
+- OV8 [P2, 9/10] Injection via schema-valid scores: valid scores can still be manipulated and steer paid triggers; quoting does not prove the consuming agent ignores instructions. Architect check: valid against :53.
+Cross-model: native review found none of OV1-OV8; overlap with native findings: OV7 extends T1/D9, OV2 extends A3/D4, OV6 extends C2/D7.
+
+### R10: Durable reservation lifecycle
+Finding: OV1, P1, confidence 9/10, docs/designs/rust-evidence-engine.md:51 ("reserves its maximum expected cost against the shared budget ... reconciled against the actual charge"), D6; reviewer: outside voice (gpt-6.1-sol), checked by architect
+Plan baseline: approved :51 and D6 (Reservation ticket, one ledger row per request).
+Runtime evidence: no code; provider billing ceilings externally unverified.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R9 | approved | unchanged | unchanged | unchanged |
+| R10 lifecycle | unspecified durability | reservation committed to SQLite before dispatch; one ticket per provider + request bounds + one physical attempt (each retry reserves again); open reservations survive cancel and restart as liabilities until settled or a configured expiry charges the estimate; settlement idempotent; ledger-write failure means no dispatch | unchanged; recorded as open item to resolve before the first live paid call | unchanged |
+| R10 tests | none | crash between reserve and settle -> still counted after restart; ambiguous timeout keeps liability; retry needs a second reservation; ledger-write failure -> zero provider requests; double settle counted once | none | none |
+Question D13:
+D13 — Must budget reservations survive crashes, timeouts and retries?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, outside-voice finding OV1 (:51, D6).
+ELI10: Before each paid call the engine sets money aside. If the engine crashes after sending the call but before writing down the cost, or a call times out and we cannot tell whether it was billed, that set-aside money must not vanish from the books. Option A writes the reservation to disk before sending, makes every retry reserve again, and refuses to send if it cannot write the ledger.
+Stakes if we pick wrong: a crash or retry storm lets real charges escape the cap and the ledger, breaking SEARCH-06.
+Recommendation: A because the cap is only hard if the books are written before the money moves.
+Completeness: A=10/10, B=5/10, C=3/10
+Pros / cons:
+A) Accept remedy (recommended)
+  ✅ Cap and ledger stay correct through crashes, restarts, timeouts and retries
+  ✅ Fail-closed: if the ledger cannot be written, no paid request leaves the machine
+  ❌ More ledger states (open, settled, expired-estimate) and five extra mocked tests
+B) Defer
+  ✅ No change now; recorded as an open item due before the first live paid call
+  ✅ Keeps M1 focus on retrieval while paid calls are still off
+  ❌ The M1 capped baseline makes paid calls, so the gap lands right when money flows
+C) Reject
+  ✅ No extra ledger complexity at all
+  ✅ Keeps the approved :51 and D6 wording exactly as signed off
+  ❌ Crash or retry can push real spend past the cap without a trace
+Net: a write-before-send ledger turns the budget cap from best-effort into a real limit (human: ~1 day / CC: ~20 min for A).
+Header: Durable reservations
+Options:
+A) Accept remedy (recommended)
+Reservation committed to SQLite before dispatch; one ticket per provider + request bounds + one physical attempt (each retry reserves again); open reservations survive cancel and restart until settled or a configured expiry charges the estimate; settlement idempotent; ledger-write failure means no dispatch. Tests: crash between reserve and settle; ambiguous timeout; retry reserves again; ledger-write failure -> zero requests; double settle counted once. Effort human ~1 day / CC ~20 min.
+B) Defer
+No contract change; recorded as an open item to resolve before the first live paid call. Other decisions unchanged.
+C) Reject
+No change; :51 and D6 stand as written.
+
+State: approved
+Actual answer: A) Accept remedy (recommended), D13, user answer 2026-10-11
+Accepted scope: reservation committed to SQLite before dispatch; one ticket per provider + request bounds + one physical attempt (each retry reserves again); open reservations survive cancel and restart until settled or a configured expiry charges the estimate; settlement idempotent; ledger-write failure means no dispatch. Tests: crash between reserve and settle; ambiguous timeout; retry reserves again; ledger-write failure -> zero requests; double settle counted once.
+History: none
+
+### R11: Credential scoping for authenticated connectors
+Finding: OV2a, P1, confidence 8/10, docs/designs/rust-evidence-engine.md:44 ("safe URL handling (scheme/host allowlist, SSRF guard ...)"), D10 (GitHub token, Stack Exchange key); reviewer: outside voice (gpt-6.1-sol), checked by architect
+Plan baseline: approved :44 URL policy and D10 credentials; no rule that credentials are bound to specific origins.
+Runtime evidence: no code. Whether the chosen HTTP client strips auth headers on cross-origin redirects is unverified.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R10 | approved | unchanged | unchanged | unchanged |
+| R12 TLS on exposed bind | pending | pending | pending | pending |
+| R11 credential scope | unspecified | each credential bound to fixed HTTPS origins (e.g. api.github.com); authenticated connector clients are separate from the anonymous page fetcher; no credential sent across origins or on HTTPS-to-HTTP downgrade (redirect to another origin is followed without credentials or refused); secrets redacted from errors, URLs, evidence and persisted artifacts | unchanged; open item before D10 credentials are first configured | unchanged |
+| R11 tests | none | mocked redirect to another origin carries no credential; HTTPS-to-HTTP redirect refused for authenticated client; anonymous fetcher never holds a credential; secret redaction in error, log and evidence output | none | none |
+Question D14:
+D14 — Should API keys be locked to the one site they belong to?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, outside-voice finding OV2a (:44, D10).
+ELI10: After D10 the engine may hold a GitHub token and a Stack Exchange key. Our URL safety rules stop the engine from visiting dangerous addresses, but they do not stop a key from being sent to the wrong safe-looking site, for example after a redirect, or over plain HTTP. Option A ties each key to its own HTTPS address, keeps keyed clients separate from the general page reader, and scrubs keys out of every error and output.
+Stakes if we pick wrong: a redirect or a crafted link could leak your GitHub token to a third-party site or into evidence text.
+Recommendation: A because keys are only safe if they can reach exactly one destination.
+Completeness: A=10/10, B=5/10, C=3/10
+Pros / cons:
+A) Accept remedy (recommended)
+  ✅ Keys can only ever be sent to their own HTTPS origin, never on redirects or downgrades
+  ✅ Redaction keeps secrets out of logs, errors, cached data and evidence returned to agents
+  ❌ Two HTTP client setups (keyed and anonymous) and four extra mocked tests
+B) Defer
+  ✅ No change now; recorded as an open item before any key is configured
+  ✅ Connectors still run unauthenticated in the meantime
+  ❌ D10 quota headroom cannot be used safely until this lands
+C) Reject
+  ✅ One shared HTTP client, slightly less code
+  ✅ URL policy still blocks private and loopback targets
+  ❌ Token leakage via redirect or log output stays possible
+Net: a separate keyed client per origin is what makes the D10 keys safe to use (human: ~4h / CC: ~15 min for A).
+Header: Credential scope
+Options:
+A) Accept remedy (recommended)
+Each credential bound to fixed HTTPS origins; keyed connector clients separate from the anonymous page fetcher; no credential across origins or on HTTPS-to-HTTP downgrade; secrets redacted from errors, URLs, evidence and persisted artifacts. Tests: cross-origin redirect carries no credential; downgrade refused; anonymous fetcher holds no credential; redaction in error, log and evidence. Effort human ~4h / CC ~15 min.
+B) Defer
+No contract change; open item to resolve before D10 credentials are first configured. Other decisions unchanged.
+C) Reject
+No change; :44 and D10 stand as written.
+
+State: approved
+Actual answer: A) Accept remedy (recommended), D14, user answer 2026-10-11
+Accepted scope: each credential bound to fixed HTTPS origins; keyed connector clients separate from the anonymous page fetcher; no credential across origins or on HTTPS-to-HTTP downgrade; secrets redacted from errors, URLs, evidence and persisted artifacts. Tests: cross-origin redirect carries no credential; downgrade refused; anonymous fetcher holds no credential; redaction in error, log and evidence.
+History: none
+
+### R12: TLS requirement for an externally exposed endpoint
+Finding: OV2b, P2, confidence 8/10, D4 ("refuses a non-loopback bind unless a bearer token is configured"); reviewer: outside voice (gpt-6.1-sol), checked by architect
+Plan baseline: approved D4 (loopback default, Origin check, bearer token).
+Runtime evidence: no code; VPS deployment is M4 work.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R11 | approved | unchanged | unchanged | unchanged |
+| R12 exposed bind | token only | non-loopback bind also requires TLS configured in the daemon or an explicit setting naming the TLS-terminating proxy or tunnel; the compose container bind published only on host loopback is exempt | unchanged; open item for the M4 VPS deployment | unchanged |
+| R12 tests | none | config validation: non-loopback + token without TLS/proxy setting refuses to start; local compose config starts | none | none |
+Question D15:
+D15 — If the engine is ever reachable from outside this PC, must traffic be encrypted?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, outside-voice finding OV2b (D4).
+ELI10: D4 says the engine only listens on this PC unless a secret token is set. On a VPS you would open it to the network, and then the token travels with every request. Without HTTPS anyone between you and the server can read the token and spend your budget. Option A makes the engine refuse to start on an open network address unless HTTPS is set up, either by the engine itself or by a named proxy or tunnel in front of it.
+Stakes if we pick wrong: a VPS deployment that leaks the bearer token in plain text on every call.
+Recommendation: A because it is one config check now and it prevents an easy mistake at deploy time.
+Completeness: A=10/10, B=6/10, C=3/10
+Pros / cons:
+A) Accept remedy (recommended)
+  ✅ An exposed deploy cannot start without HTTPS, so the token is never sent in clear
+  ✅ Local compose use is unchanged, since the loopback-published container is exempt
+  ❌ VPS setup must include TLS or a tunnel, one more deployment step
+B) Defer
+  ✅ No change now; recorded as an open item for the M4 VPS deployment
+  ✅ M1 runs only on loopback, so nothing is exposed meanwhile
+  ❌ Relies on remembering the rule when M4 deployment is planned
+C) Reject
+  ✅ Simplest config, token alone protects the endpoint
+  ✅ D4 stays exactly as approved
+  ❌ A VPS deployment over plain HTTP exposes the token to the network
+Net: a single startup check removes a likely deployment mistake (human: ~1h / CC: ~5 min for A).
+Header: TLS when exposed
+Options:
+A) Accept remedy (recommended)
+Non-loopback bind also requires TLS configured in the daemon or an explicit setting naming the TLS-terminating proxy or tunnel; compose container bind published only on host loopback is exempt. Tests: non-loopback + token without TLS/proxy setting refuses to start; local compose config starts. Effort human ~1h / CC ~5 min.
+B) Defer
+No contract change; open item for the M4 VPS deployment. Other decisions unchanged.
+C) Reject
+No change; D4 stands as written.
+
+State: approved
+Actual answer: A) Accept remedy (recommended), D15, user answer 2026-10-11
+Accepted scope: non-loopback bind also requires TLS configured in the daemon or an explicit setting naming the TLS-terminating proxy or tunnel; compose container bind published only on host loopback is exempt. Tests: non-loopback + token without TLS/proxy setting refuses to start; local compose config starts.
+History: none
+
+### R13: Development set vs sealed acceptance set, predeclared analysis
+Finding: OV3, P1, confidence 9/10, docs/designs/rust-evidence-engine.md:24 ("M1 comparisons are exploratory; only the final acceptance run can claim parity"), :58 ("frozen query set"), :66 ("best of Parallel/Exa"); reviewer: outside voice (gpt-6.1-sol), checked by architect
+Plan baseline: approved :24 equivalence definition; no held-out set, comparator rule or stopping rule.
+Runtime evidence: no eval exists.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R12 | approved | unchanged | unchanged | unchanged |
+| R7/D9 grader gate | approved (reopen pending as R18) | unchanged | unchanged | unchanged |
+| R13 sets | one frozen set | the 42-query seed and any query seen in development form the development set, free for tuning; the parity claim uses a separate sealed acceptance set built under the approved protocol and never used for tuning | unchanged; open item before the final acceptance run | unchanged |
+| R13 analysis plan | none | locked before the acceptance run (hash recorded): category weights, comparator rule (how the best of Parallel/Exa is chosen; simultaneous inference if chosen from acceptance results), equivalence test, stopping rule; values stay open for user approval | none | none |
+| R13 tests | none | harness refuses an acceptance run without a locked plan file; plan change after the first acceptance run is flagged; every acceptance run is counted and reported | none | none |
+Question D16:
+D16 — Should the final parity test use questions the engine was never tuned on?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, outside-voice finding OV3 (:24, :58, :66).
+ELI10: If we tune the engine on the same 42 questions we later use to prove it ties with Exa and Parallel, the engine gets graded on questions it has effectively studied, and a tie becomes too easy. Picking whichever paid service did better after seeing the scores, or rerunning until it passes, also tilts the result. Option A keeps the 42 as practice questions, builds a separate sealed exam set, and locks the scoring rules before the exam is run.
+Stakes if we pick wrong: a parity claim that looks proven but is really overfitting, which defeats SEARCH-09.
+Recommendation: A because a sealed set plus a locked analysis plan is the standard way to make an equivalence claim believable.
+Completeness: A=10/10, B=5/10, C=3/10
+Pros / cons:
+A) Accept remedy (recommended)
+  ✅ The parity claim is tested on questions never used for tuning, so overfitting cannot fake it
+  ✅ Locked weights, comparator and stopping rules remove choose-after-seeing bias
+  ❌ You must build a second query set later, and its size comes from the power calculation
+B) Defer
+  ✅ No change now; open item before the final acceptance run
+  ✅ M1 is exploratory anyway, so nothing is claimed in the meantime
+  ❌ Development may quietly use acceptance-style queries before the split exists
+C) Reject
+  ✅ Only one query set to build and maintain
+  ✅ :24 still forbids a parity claim from M1 exploratory runs
+  ❌ Final equivalence would be measured on tuned-on questions
+Net: a second sealed question set is the price of a parity claim that holds up (human: days of query harvesting / CC: ~30 min harness work for A).
+Header: Sealed acceptance set
+Options:
+A) Accept remedy (recommended)
+The 42-query seed and any query seen in development form the development set, free for tuning. The parity claim uses a separate sealed acceptance set built under the approved protocol and never used for tuning. Before the acceptance run a locked analysis plan (hash recorded) fixes category weights, comparator rule (simultaneous inference if chosen from acceptance results), equivalence test and stopping rule; values stay open for your approval. Tests: harness refuses an acceptance run without a locked plan; plan change after first run flagged; every acceptance run counted.
+B) Defer
+No contract change; open item before the final acceptance run. Other decisions unchanged.
+C) Reject
+No change; one frozen set used for development and acceptance.
+
+State: approved
+Actual answer: A) Accept remedy (recommended), D16, user answer 2026-10-11
+Accepted scope: the 42-query seed and any query seen in development form the development set, free for tuning. The parity claim uses a separate sealed acceptance set built under the approved protocol and never used for tuning. Before the acceptance run a locked analysis plan (hash recorded) fixes category weights, comparator rule (simultaneous inference if chosen from acceptance results), equivalence test and stopping rule; values stay open for user approval. Tests: harness refuses an acceptance run without a locked plan; plan change after first run flagged; every acceptance run counted.
+History: none
+
+### R14: Discovery freshness separate from content freshness
+Finding: OV4, P2, confidence 9/10, docs/designs/rust-evidence-engine.md:52 ("'Latest', release and date-sensitive queries: short TTL, plus revalidation before reuse"), :56 ("cold and warm cache reported separately"); reviewer: outside voice (gpt-6.1-sol), checked by architect
+Plan baseline: approved :52 cache freshness and :56 cost protocol wording.
+Runtime evidence: no code.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1-R13 | approved | unchanged | unchanged | unchanged |
+| R14 freshness layers | one TTL per key | separate discovery TTL (query to candidate URLs) and content TTL (URL to page); when the discovery TTL expires, discovery reruns even if cached pages revalidate unchanged; evidence records searched_at, fetched_at and validated_at | unchanged; open item before the first cache implementation | unchanged |
+| R14 cold/warm | undefined | cold = query, URL and content caches empty; warm = caches prepared by a recorded prior run; warm-path rediscovery and revalidation costs and latency are counted | undefined | undefined |
+| R14 tests | :52 tests | new release published at a new URL while every cached page still returns 304: found after the discovery TTL; timestamps present; cold-run harness starts with empty caches | none | none |
+Question D17:
+D17 — Should "latest release" questions re-search, not just re-check old pages?
+Project/branch/task: web-search-mcp on main, /plan-eng-review of docs/designs/rust-evidence-engine.md, outside-voice finding OV4 (:52, :56).
+ELI10: The cache rule re-checks saved pages before reusing them. But if a library ships version 3.0 on a brand-new page, the old 2.9 page still re-checks as unchanged, so the engine keeps saying 2.9 is the latest and marks it fresh. Option A gives "which pages answer this question" its own short expiry, so the engine searches again, and records when it searched, fetched and re-checked. It also defines what a cold and a warm cache mean for the cost measurements.
+Stakes if we pick wrong: confidently stale answers for exactly the release and version questions that are a core category.
+Recommendation: A because searching again is the only way to see a page that did not exist last time.
+Completeness: A=10/10, B=5/10, C=3/10
+Pros / cons:
+A) Accept remedy (recommended)
+  ✅ New releases at new URLs are found once the discovery TTL expires
+  ✅ Three timestamps let agents and graders see exactly how fresh each piece is
+  ❌ Two TTL settings to tune, and warm runs spend a little more on rediscovery
+B) Defer
+  ✅ No change now; open item before the cache is implemented
+  ✅ :52 revalidation still catches changed pages in the meantime
+  ❌ The recent-releases category can return stale answers flagged as fresh
+C) Reject
+  ✅ One TTL per key, simplest cache logic
+  ✅ :52 contract stays exactly as approved
+  ❌ Stale "latest" answers marked fresh, and cold/warm cost numbers stay ambiguous
+Net: a second TTL is cheap insurance for the release category (human: ~4h / CC: ~15 min for A).
+Header: Discovery freshness
+Options:
+A) Accept remedy (recommended)
+Separate discovery TTL (query to candidate URLs) and content TTL (URL to page); expired discovery reruns even when cached pages revalidate unchanged; evidence records searched_at, fetched_at, validated_at. Cold = query, URL and content caches empty; warm = caches prepared by a recorded prior run; warm rediscovery and revalidation costs and latency counted. Tests: new release at a new URL while cached pages return 304 is found after the discovery TTL; timestamps present; cold harness starts empty. Effort human ~4h / CC ~15 min.
+B) Defer
+No contract change; open item before the cache is implemented. Other decisions unchanged.
+C) Reject
+No change; :52 and :56 stand as written.
+
+State: approved
+Actual answer: A) Accept remedy (recommended), D17, user answer 2026-10-11
+Accepted scope: separate discovery TTL (query to candidate URLs) and content TTL (URL to page); expired discovery reruns even when cached pages revalidate unchanged; evidence records searched_at, fetched_at, validated_at. Cold = query, URL and content caches empty; warm = caches prepared by a recorded prior run; warm rediscovery and revalidation costs and latency counted. Tests: new release at a new URL while cached pages return 304 is found after the discovery TTL; timestamps present; cold harness starts empty.
+History: none
+
+### R15: Batch settlement of OV5, OV6, OV7 (reopens R7/D9), OV8 and the CI TODO
+Finding: OV5 P2 9/10 (:56 cost protocol), OV6 P2 10/10 (:50 precedence), OV7 P2 9/10 (D9), OV8 P2 9/10 (:53 untrusted boundary), TODO candidate (Distribution Plan); reviewer: outside voice (gpt-6.1-sol) for OV5-OV8, native for the TODO; each checked by the architect.
+Plan baseline: approved :50, :53, :56, D9; TODOS.md absent.
+Runtime evidence: no code.
+Comparison grid:
+| Choice | Current | A (accept all) | B (defer all) | C (one by one) |
+|---|---|---|---|---|
+| R1-R14 | approved | unchanged | unchanged | unchanged |
+| OV5 comparative cost | undefined for references | per-system comparative per-query cost; reference calls booked as eval spend and as reference operating cost | open item | asked separately |
+| OV6 successful empty | no class | `failed(no_match)`, distinct from unsearched | open item | asked separately |
+| OV7 grader bias | D9 pooled agreement | paired sample, signed error per system and category, differential bias below margin | open item | asked separately |
+| OV8 judge influence | :53 as written | ID-bound judge output, code-bounded triggers, no secrets in judge context, delimiter-safe packaging, schema-valid adversarial fixtures, downstream isolation unverified | open item | asked separately |
+| TODO CI + multi-arch | none | added to TODOS.md (P3) | added to TODOS.md as deferred | asked separately |
+Question D18: (sent as written in chat 2026-10-11; one question at the user's request to stop per-item questions)
+D18 — Settle the last 4 findings and the TODO in one answer? Items 1-5 as listed in Comparison grid column A. Recommendation: A because each item is a contract clarification, not new scope. Completeness: A=10/10, B=5/10, C=10/10.
+Header: Finish in one go
+Options:
+A) Accept all 5 (recommended)
+Apply items 1-5 to the design doc, add TODOS.md, then save the report and log.
+B) Defer all 5
+Record items 1-5 as open items under Open Questions and in TODOS.md; no contract changes.
+C) One by one
+Ask each of the 5 separately.
+
+State: approved
+Actual answer: A) Accept all 5 (recommended), D18, user answer 2026-10-11 (user asked to stop the per-item questions; batch chosen by the user)
+Accepted scope: OV5 comparative per-system cost views with dual booking and fixtures; OV6 `failed(no_match)` with end-to-end schema tests; OV7 D9 extension (paired sample, signed per-system error, differential-bias bound below margin, biased-grader test); OV8 judge influence boundary with schema-valid adversarial fixtures and downstream isolation marked unverified; TODOS.md entry "CI and multi-arch image builds" (P3).
+History: none
+
+Approval readiness: PASS. Checked R1 (D3), R2 (D4), R3 (D5), R4 (D6), R5 (D7), R6 (D8), R7 (D9, extended by D18), R8 (D10), R9 (D11), R10 (D13), R11 (D14), R12 (D15), R13 (D16), R14 (D17), R15 (D18); scope record (D2); outside voice approval (D12). Every accepted remedy cites its own user answer. No pending decisions.
+
+## Review body
+
+### NOT in scope
+- Load/soak tests, VPS deployment checks and observability dashboards: already deferred M3/M4 obligations in the plan.
+- Publishing images or a hosted remote: needs separate user approval (TODOS.md, P3).
+- Choosing the target values (equivalence margin, agreement threshold, sample sizes, eval spend cap, monthly cap): the user's call; they stay under Open Questions.
+- Native Windows ARM64 Rust toolchain: not needed for M1 after D3 (build and test in Docker/WSL2); the install decision stays with the user.
+
+### What already exists
+- No code. Reused: Pi's built-in streamable-HTTP MCP client with bearer-token env support (pi docs mcp.md), the official `rmcp` SDK (verify at implementation), SearXNG upstream container, SQLite. mcp-searxng and Kindly were rejected as a base by decision S006; they can serve as reference behavior for connector fixtures only.
+
+### Diagrams
+```
+Pi session(s) --HTTP+token--> [engine daemon (compose)] <-- stdio forwarder (optional)
+                                   |
+   classify (Judge slot, heuristic default) -> plan stages (required/optional)
+                                   |
+   retrieve: SearXNG | GitHub | StackExchange | ... --(trigger)--> paid gate (Reservation, durable) -> Exa/Parallel
+                                   |
+   fetch/extract (URL policy, resolve-then-pin, no env proxy) -> judge (ID-bound) -> packager
+                                   |
+   status: complete | partial | failed(class incl. no_match) + stage outcomes + degraded + timestamps
+                                   |
+   SQLite: cache (discovery TTL, content TTL, byte cap LRU) | ledger (never evicted)
+
+eval crate: dev set (42 seed) -> exploratory runs | sealed acceptance set + locked plan -> paired grading -> gate -> TOST/bootstrap
+```
+Inline diagram suggested in the controller module (status precedence) and the ledger module (reservation states open -> settled | expired-estimate).
+
+### Failure modes
+| Path | Realistic failure | Handling / test | User-visible |
+|---|---|---|---|
+| Pi -> daemon | daemon down | stdio forwarder failed(internal); Pi shows a disconnected server | clear error |
+| SearXNG | engines CAPTCHA'd | D5 degraded/failed fixtures | partial with unsearched gaps |
+| GitHub/SE | quota exhausted | D10 skipped(policy, quota) | partial, reason + reset time |
+| Paid fallback | crash mid-call | D13 durable reservation, restart test | spend in ledger, cap held |
+| Fetch | redirect to private IP or proxy env | URL policy proofs | stage failed(policy) |
+| Cache | new release at new URL | D17 discovery TTL test | fresh answer after TTL |
+| Judge | injected page scores | D18 OV8 fixtures, code-bounded triggers | no policy change |
+| Eval | biased grader | D9 + D18 paired gate | run labeled unvalidated |
+Critical gaps (no test, no handling, silent): 0.
+
+### Worktree parallelization strategy
+| Step | Modules touched | Depends on |
+|------|----------------|------------|
+| Ledger, paid gate, cache store | engine/store, engine/paid | — |
+| Fetch/extract + URL policy | engine/fetch | — |
+| Retrievers (SearXNG, GitHub, SE) | engine/retrieve | fetch (shared HTTP clients) |
+| Controller, classification, status | engine/controller, engine/judge, engine/package | store, retrieve |
+| MCP transport (HTTP, stdio forwarder) | mcp/ | controller API |
+| Eval harness (stats, packets, gate, sealed set) | eval/ | store (ledger API) only |
+Parallel lanes: Lane A: store/paid -> controller -> mcp. Lane B: fetch -> retrieve (then merge into A before controller). Lane C: eval (independent until the capped baseline run).
+Execution order: launch A + B + C. Merge B into A before the controller work. Integrate C at the baseline run.
+Conflict flags: shared HTTP client config (D14) between fetch and retrieve; ledger API shared by engine and eval.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific finding above. Run with the implementer role or inline; checkbox as you ship. Effort assumes the default ratios (features ~30x, tests ~50x).
+
+- [ ] **T1 (P1, human: ~1 day / CC: ~20 min)** — engine/store — Durable ledger with reservation states and paid gate (D6, D13)
+  - Surfaced by: Code Quality C1; Outside voice OV1
+  - Files: engine/src/store, engine/src/paid
+  - Verify: cargo test -p engine paid:: store:: (crash/restart, ambiguous timeout, retry, write failure, double settle)
+- [ ] **T2 (P1, human: ~1 day / CC: ~20 min)** — engine daemon + mcp — Single-daemon topology, stdio forwarder, HTTP access control and TLS check (D3, D4, D15)
+  - Surfaced by: Architecture A1, A3; Outside voice OV2b
+  - Files: mcp/src, compose file
+  - Verify: cargo test -p mcp (Origin 403, token 401, bind refusals, daemon-down failed(internal))
+- [ ] **T3 (P1, human: ~4h / CC: ~15 min)** — engine/fetch — URL policy proofs and credential-scoped clients (D14 + required proofs)
+  - Surfaced by: Test review required proof; Outside voice OV2a
+  - Files: engine/src/fetch
+  - Verify: cargo test -p engine fetch:: (mapped IPv6, decimal IPs, proxy env ignored, redirect hops, decompressed cap, cross-origin credential strip)
+- [ ] **T4 (P1, human: ~4h / CC: ~15 min)** — engine/controller — Status semantics: required/optional, degraded, no_match (D5, D7, D18-OV6)
+  - Surfaced by: Architecture A2; Code Quality C2; Outside voice OV6
+  - Files: engine/src/controller, engine/src/package
+  - Verify: cargo test -p engine status:: plus golden schema test
+- [ ] **T5 (P1, human: ~1 day / CC: ~30 min)** — eval — Dev vs sealed acceptance set, locked analysis plan, paired grader gate (D9, D16, D18-OV7)
+  - Surfaced by: Test review T1; Outside voice OV3, OV7
+  - Files: eval/src
+  - Verify: cargo test -p eval (lock refusal, run counter, biased-grader fails gate, stats on synthetic data, blinding)
+- [ ] **T6 (P2, human: ~3h / CC: ~10 min)** — engine/judge — Classification through Judge slot with heuristic default (D8)
+  - Surfaced by: Code Quality C3
+  - Files: engine/src/judge, engine/src/controller
+  - Verify: cargo test -p engine classify::
+- [ ] **T7 (P2, human: ~4h / CC: ~15 min)** — engine/judge — Judge influence boundary and schema-valid adversarial fixtures (D18-OV8)
+  - Surfaced by: Outside voice OV8
+  - Files: engine/src/judge, engine/tests/fixtures
+  - Verify: cargo test -p engine injection::
+- [ ] **T8 (P2, human: ~4h / CC: ~15 min)** — engine/store — Discovery vs content TTL, timestamps, byte cap LRU (D11, D17)
+  - Surfaced by: Performance P2; Outside voice OV4
+  - Files: engine/src/store
+  - Verify: cargo test -p engine cache:: (new-URL release, eviction, ledger untouched)
+- [ ] **T9 (P2, human: ~3h / CC: ~10 min)** — engine/retrieve — Quota tracking and optional free keys (D10)
+  - Surfaced by: Performance P1
+  - Files: engine/src/retrieve, Sources.md (vault)
+  - Verify: cargo test -p engine quota::
+- [ ] **T10 (P2, human: ~3h / CC: ~10 min)** — eval — Comparative per-system cost views with dual booking (D18-OV5)
+  - Surfaced by: Outside voice OV5
+  - Files: eval/src/cost
+  - Verify: cargo test -p eval cost::
+- [ ] **T11 (P3, human: ~1 day / CC: ~30 min)** — infra — CI and multi-arch builds (TODOS.md)
+  - Surfaced by: TODO, Distribution check
+  - Files: CI config (after a remote is approved)
+  - Verify: CI run green on the offline suite
+
+### Unresolved decisions
+None in this review. User-owned target values remain under Open Questions (margin, agreement metric and threshold, sample sizes, acceptance-set construction, eval spend cap, protocols, market sources, robots policy, extractor, toolchain).
+
+### Completion summary
+- Step 0: Scope Challenge — scope accepted as-is (structure: smaller 3-crate arrangement, D2)
+- Architecture Review: 3 issues found
+- Code Quality Review: 3 issues found
+- Test Review: diagram produced, 6 gaps identified (T1 plus 5 required-proof additions)
+- Performance Review: 2 issues found
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 1 item proposed to user (accepted via D18)
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: workflow_agent reviewer (openrouter/openai/gpt-6.1-sol), completed, 8 findings, all accepted (D13-D18)
+- Parallelization: 3 lanes, 3 parallel / 0 sequential (lane B merges into A before the controller)
+- Lake Score: 15/15
+
+### Suppressed findings
+- (confidence 4/10) ONNX runtime availability and latency on Windows/Linux ARM64: unverified; already measurement-driven per premise 5.
+- (confidence 4/10) Quick-mode stage deadline split: no numbers until M1 latency-per-stage measurement.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Outside Review | workflow_agent reviewer (openrouter/openai/gpt-6.1-sol), via /plan-eng-review | Independent 2nd opinion | 1 | completed | 8 findings, 8 accepted |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 14 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**OUTSIDE COVERAGE:** workflow_agent reviewer (openrouter/openai/gpt-6.1-sol), eng-review phase, completed, 8 findings (OV1-OV8), all accepted through D13-D18.
+**CROSS-MODEL:** native review and the outside reviewer overlapped on transport auth (A3/OV2b), status semantics (C2/OV6) and grader validity (T1/OV7); OV1, OV3, OV4, OV5, OV8 were found only by the outside reviewer. Agreement is advisory, not verification.
+**VERDICT:** No review CLEAR. All 14 issues and 8 outside findings have approved remedies mapped to tasks T1-T11; status is ISSUES OPEN because issues were found, not because decisions are pending. eng review required
+
+NO UNRESOLVED DECISIONS
