@@ -993,6 +993,14 @@ None in this review. User-owned target values remain under Open Questions (margi
 - (confidence 4/10) ONNX runtime availability and latency on Windows/Linux ARM64: unverified; already measurement-driven per premise 5.
 - (confidence 4/10) Quick-mode stage deadline split: no numbers until M1 latency-per-stage measurement.
 
+## Decisions after review
+
+### D19: Provider charge above the reserved bound (user, 2026-10-12)
+Context: T1 part B review. The paid gate reserves a code-set maximum per attempt. A provider can still report a higher actual charge, which means its declared bound is wrong.
+Question: should the engine disable such a provider automatically?
+Actual answer (user): "disclosed and ask for decision rather then disabling automatically".
+Accepted scope: the gate records the real charge as-is (never clamped) and discloses the excess as `PaidCallRecord::over_bound_micros`. The controller/daemon raises the violation to the user for a decision and never disables the provider on its own. This is not a per-query decision: it fires only on a provider-bound defect. The user-facing request is not built yet (TODOS.md).
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

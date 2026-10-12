@@ -313,9 +313,9 @@ pub struct PaidCallRecord {
     /// the real charge. If settlement fails, the row stays open at its
     /// `max_cost_micros` estimate and the books undercount by
     /// `over_bound_micros` until reconciliation. Callers and the controller
-    /// must treat a `Some(_)` as a provider-bound defect; whether to disable
-    /// such a provider is a controller decision and is deliberately not
-    /// implemented in this gate.
+    /// must treat a `Some(_)` as a provider-bound defect. Decision D19 (user,
+    /// 2026-10-12): a bound violation is disclosed and raised to the user for
+    /// a decision; the engine never disables a provider automatically.
     pub over_bound_micros: Option<Micros>,
 }
 
