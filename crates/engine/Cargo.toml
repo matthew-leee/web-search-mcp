@@ -15,7 +15,11 @@ onnx = []
 rusqlite.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only runtime surface: #[tokio::test], multi-threaded runs for the
+# concurrency test. The production code needs only rt/time/sync.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

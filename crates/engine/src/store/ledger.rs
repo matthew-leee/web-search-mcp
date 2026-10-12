@@ -126,7 +126,7 @@ pub enum LedgerError {
     Storage(#[from] rusqlite::Error),
 }
 
-/// State of an outstanding reservation row.
+/// State of a reservation row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservationState {
     /// Reserved and awaiting settlement; counts at its `max_cost` estimate.
@@ -134,9 +134,12 @@ pub enum ReservationState {
     /// Aged past the configured expiry and charged at its `max_cost` estimate
     /// until a late settlement reports the actual charge.
     Expired,
+    /// Settlement recorded the attempt. Counts at its `actual_micros` when the
+    /// settlement reported one, otherwise at its `max_cost` estimate.
+    Settled,
 }
 
-/// Read-only snapshot of an outstanding (not yet settled) reservation row.
+/// Read-only snapshot of a reservation row, in any state.
 ///
 /// This is an inspection record, not a dispatch ticket: only [`Ledger::reserve`]
 /// can issue the [`Reservation`] the paid gate accepts.
@@ -148,12 +151,35 @@ pub struct ReservationInfo {
     pub provider: String,
     /// Maximum cost reserved, in micro-USD.
     pub max_cost_micros: Micros,
-    /// Whether the row is still `open` or was aged out to `expired`.
+    /// Actual charge recorded at settlement, in micro-USD.
+    ///
+    /// `None` while the row is unsettled (`open` or `expired`) and for a
+    /// settlement that reported no amount; in both cases the row counts at its
+    /// `max_cost_micros` estimate instead.
+    pub actual_micros: Option<Micros>,
+    /// Whether the row is still `open`, was aged out to `expired`, or is
+    /// `settled`.
     pub state: ReservationState,
     /// Creation time as Unix seconds (UTC).
     pub created_at_unix: i64,
     /// UTC accounting period (`YYYY-MM`) derived from `created_at_unix`.
     pub period: String,
+}
+
+/// What a settlement actually recorded on the reservation row.
+///
+/// The recorded charge is authoritative: on an idempotent replay the first
+/// settlement's amount stands and is reported here, so a caller always learns
+/// what the books count instead of echoing back what it tried to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleReceipt {
+    /// The actual charge now on the row, in micro-USD: the first settlement's
+    /// amount wins on an idempotent replay; a settled row without a recorded
+    /// actual reports its `max_cost` estimate (what it counts as on the books).
+    pub recorded_micros: Micros,
+    /// `true` when the row was already settled before this call (idempotent
+    /// replay): `recorded_micros` is the earlier amount, not this call's.
+    pub already_settled: bool,
 }
 
 /// A budget reservation ticket: proof that the cost of one paid attempt is
@@ -413,11 +439,13 @@ impl Ledger {
     }
 
     /// Settle the attempt a [`Reservation`] ticket stands for, consuming the
-    /// ticket and recording the actual charge in micro-USD.
+    /// ticket and recording the actual charge in micro-USD. The returned
+    /// [`SettleReceipt`] reports the authoritative charge now on the row.
     ///
     /// Reconciliation rules:
     /// - the first settlement wins; settling an already-settled id again is a
-    ///   no-op that returns `Ok` (idempotent double-settle must be counted once);
+    ///   no-op whose receipt reports `already_settled` and the first recorded
+    ///   amount (idempotent double-settle must be counted once);
     /// - settling an `expired` row records the actual charge and settles it;
     /// - an `actual_micros` above the reserved maximum is recorded as-is: the
     ///   ledger reports reality even though the cap was enforced on the estimate.
@@ -429,21 +457,23 @@ impl Ledger {
         reservation: Reservation,
         actual_micros: Micros,
         now_unix: i64,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<SettleReceipt, LedgerError> {
         self.settle_by_id(&reservation.id, actual_micros, now_unix)
     }
 
     /// Settle a reservation by id, for restart and late-charge reconciliation
-    /// when the original ticket no longer exists.
+    /// when the original ticket no longer exists. The returned
+    /// [`SettleReceipt`] reports the authoritative charge now on the row.
     ///
-    /// Idempotent with the same rules as [`Ledger::settle`]; unknown ids are
-    /// rejected so a silent no-op cannot hide a lost charge.
+    /// Idempotent with the same rules as [`Ledger::settle`]: an idempotent
+    /// replay reports `already_settled` and keeps the first recorded charge;
+    /// unknown ids are rejected so a silent no-op cannot hide a lost charge.
     pub fn settle_by_id(
         &self,
         id: &str,
         actual_micros: Micros,
         now_unix: i64,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<SettleReceipt, LedgerError> {
         if actual_micros < 0 {
             return Err(LedgerError::InvalidAmount(format!(
                 "actual_micros must be >= 0, got {actual_micros}"
@@ -458,21 +488,39 @@ impl Ledger {
              WHERE id = ?1 AND state != 'settled'",
             params![id, actual_micros, now_unix],
         )?;
-        if changed == 0 {
-            let known: Option<String> = tx
+        let receipt = if changed == 0 {
+            let known: Option<(String, Option<Micros>, Micros)> = tx
                 .query_row(
-                    "SELECT state FROM reservations WHERE id = ?1",
+                    "SELECT state, actual_micros, max_cost_micros FROM reservations WHERE id = ?1",
                     params![id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            // Some(_) means already settled: keep the first actual charge.
-            if known.is_none() {
-                return Err(LedgerError::UnknownReservation(id.to_owned()));
+            match known {
+                None => return Err(LedgerError::UnknownReservation(id.to_owned())),
+                // Already settled: the first recorded charge stands. A settled
+                // row without a recorded actual reports (and counts) its
+                // estimate, matching `committed_in`.
+                Some((state, actual, max_cost)) => match parse_state(&state)? {
+                    ReservationState::Settled => SettleReceipt {
+                        recorded_micros: actual.unwrap_or(max_cost),
+                        already_settled: true,
+                    },
+                    other => {
+                        return Err(LedgerError::Corrupt(format!(
+                            "settle changed no row for reservation {id} but its state is {other:?}"
+                        )));
+                    }
+                },
             }
-        }
+        } else {
+            SettleReceipt {
+                recorded_micros: actual_micros,
+                already_settled: false,
+            }
+        };
         tx.commit()?;
-        Ok(())
+        Ok(receipt)
     }
 
     /// Mark `open` rows older than `max_age_secs` as `expired`, charging each at
@@ -514,39 +562,25 @@ impl Ledger {
     /// `expired` rows are included on purpose: they are still unsettled
     /// liabilities that restart/late-charge reconciliation must be able to find
     /// and settle via [`Ledger::settle_by_id`]. Unknown budgets are rejected for
-    /// the same reason as in [`Ledger::committed_micros`].
+    /// the same reason as in [`Ledger::committed_micros`]. For the full audit
+    /// history including settled rows, use [`Ledger::reservations`].
     pub fn open_reservations(&self, budget: &str) -> Result<Vec<ReservationInfo>, LedgerError> {
         let conn = self.lock();
         ensure_budget(&conn, budget)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, provider, max_cost_micros, state, created_at, period
-             FROM reservations
-             WHERE budget = ?1 AND state != 'settled'
-             ORDER BY created_at, id",
-        )?;
-        let rows = stmt.query_map(params![budget], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Micros>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, provider, max_cost_micros, state, created_at_unix, period) = row?;
-            out.push(ReservationInfo {
-                id,
-                provider,
-                max_cost_micros,
-                state: parse_state(&state)?,
-                created_at_unix,
-                period,
-            });
-        }
-        Ok(out)
+        read_reservation_rows(&conn, budget, true)
+    }
+
+    /// All reservation rows for a budget — `open`, `expired` and `settled` —
+    /// ordered by `created_at`, then `id`.
+    ///
+    /// This is the audit view behind the paid gate's disclosure records: every
+    /// provider request ever reserved against the budget, with the actual
+    /// charge where settlement recorded one. Unknown budgets are rejected for
+    /// the same reason as in [`Ledger::committed_micros`].
+    pub fn reservations(&self, budget: &str) -> Result<Vec<ReservationInfo>, LedgerError> {
+        let conn = self.lock();
+        ensure_budget(&conn, budget)?;
+        read_reservation_rows(&conn, budget, false)
     }
 
     /// The connection, tolerating a poisoned mutex: a panic between statements
@@ -554,6 +588,101 @@ impl Ledger {
     /// guard keeps the daemon alive instead of failing every later write.
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Marker module sealing [`BudgetLedger`] to in-crate implementations.
+pub(crate) mod sealed {
+    /// Implemented only by the in-crate `BudgetLedger` implementations; an
+    /// outside crate cannot name (or satisfy) this supertrait, so it cannot
+    /// implement [`BudgetLedger`](super::BudgetLedger).
+    pub trait Sealed {}
+}
+
+/// The budget operations the paid gate needs, split out so the gate's
+/// fail-closed behavior can be tested against fakes.
+///
+/// Why this trait is safe: **it is sealed.** The `sealed::Sealed` supertrait is
+/// implemented only for types inside this crate, and those are all reviewed
+/// here, so no outside implementation can weaken the gate (for example by
+/// handing back a ticket minted for a different request). Tickets themselves
+/// cannot be minted outside `store::ledger` at all ([`Reservation`]'s fields
+/// are private and only [`Ledger::reserve`] constructs one), so even an
+/// in-crate fake can only fail or delegate to a real [`Ledger`]. The paid gate
+/// dispatches a provider request if and only if this trait hands back a real
+/// ticket — and it re-checks that the ticket matches the request first.
+///
+/// ```compile_fail,E0277
+/// use engine::store::ledger::{
+///     BudgetLedger, LedgerError, Micros, Reservation, SettleReceipt,
+/// };
+///
+/// struct Outside;
+///
+/// impl BudgetLedger for Outside {
+///     fn reserve(
+///         &self,
+///         _budget: &str,
+///         _provider: &str,
+///         _max_cost: Micros,
+///         _now_unix: i64,
+///     ) -> Result<Reservation, LedgerError> {
+///         unimplemented!()
+///     }
+///
+///     fn settle(
+///         &self,
+///         _reservation: Reservation,
+///         _actual: Micros,
+///         _now_unix: i64,
+///     ) -> Result<SettleReceipt, LedgerError> {
+///         unimplemented!()
+///     }
+/// }
+///
+/// fn main() {}
+/// ```
+pub trait BudgetLedger: sealed::Sealed + Send + Sync + 'static {
+    /// Reserve the maximum expected cost of one physical attempt; see
+    /// [`Ledger::reserve`].
+    fn reserve(
+        &self,
+        budget: &str,
+        provider: &str,
+        max_cost: Micros,
+        now_unix: i64,
+    ) -> Result<Reservation, LedgerError>;
+
+    /// Settle an attempt and consume its ticket, reporting the authoritative
+    /// charge the ledger recorded; see [`Ledger::settle`].
+    fn settle(
+        &self,
+        reservation: Reservation,
+        actual: Micros,
+        now_unix: i64,
+    ) -> Result<SettleReceipt, LedgerError>;
+}
+
+impl sealed::Sealed for Ledger {}
+
+impl BudgetLedger for Ledger {
+    fn reserve(
+        &self,
+        budget: &str,
+        provider: &str,
+        max_cost: Micros,
+        now_unix: i64,
+    ) -> Result<Reservation, LedgerError> {
+        Ledger::reserve(self, budget, provider, max_cost, now_unix)
+    }
+
+    fn settle(
+        &self,
+        reservation: Reservation,
+        actual: Micros,
+        now_unix: i64,
+    ) -> Result<SettleReceipt, LedgerError> {
+        Ledger::settle(self, reservation, actual, now_unix)
     }
 }
 
@@ -572,6 +701,57 @@ fn committed_in(conn: &Connection, budget: &str, period: &str) -> Result<Micros,
         |row| row.get(0),
     )?;
     Ok(committed)
+}
+
+/// Reservation rows for `budget`, ordered by `created_at` then `id`.
+///
+/// With `only_unsettled`, settled rows are left out (the outstanding-liability
+/// view); otherwise every row is returned for auditing.
+fn read_reservation_rows(
+    conn: &Connection,
+    budget: &str,
+    only_unsettled: bool,
+) -> Result<Vec<ReservationInfo>, LedgerError> {
+    let mut stmt = if only_unsettled {
+        conn.prepare(
+            "SELECT id, provider, max_cost_micros, state, actual_micros, created_at, period
+             FROM reservations
+             WHERE budget = ?1 AND state != 'settled'
+             ORDER BY created_at, id",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT id, provider, max_cost_micros, state, actual_micros, created_at, period
+             FROM reservations
+             WHERE budget = ?1
+             ORDER BY created_at, id",
+        )?
+    };
+    let rows = stmt.query_map(params![budget], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Micros>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<Micros>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, provider, max_cost_micros, state, actual_micros, created_at_unix, period) = row?;
+        out.push(ReservationInfo {
+            id,
+            provider,
+            max_cost_micros,
+            actual_micros,
+            state: parse_state(&state)?,
+            created_at_unix,
+            period,
+        });
+    }
+    Ok(out)
 }
 
 /// Set the WAL journal mode and return the mode SQLite reports.
@@ -646,6 +826,7 @@ fn parse_state(state: &str) -> Result<ReservationState, LedgerError> {
     match state {
         "open" => Ok(ReservationState::Open),
         "expired" => Ok(ReservationState::Expired),
+        "settled" => Ok(ReservationState::Settled),
         other => Err(LedgerError::Corrupt(format!(
             "unexpected reservation state {other:?}"
         ))),

@@ -7,7 +7,7 @@ This page links three layers together:
 - the **M1 build steps**, from the design doc's "Next Steps";
 - **tasks** T1 to T11, from the engineering review ("Implementation Tasks" in [designs/rust-evidence-engine.md](designs/rust-evidence-engine.md)).
 
-Status values: done, in progress, not started. Last updated: 2026-10-11.
+Status values: done, in progress, not started. Last updated: 2026-10-12.
 
 ## Overview
 
@@ -34,7 +34,7 @@ Build steps (design doc "Next Steps") and the tasks attached to each:
 | 1 | Approvals: Rust toolchain (done: WSL2), M1 eval spend cap, comparison and cost protocols | none | partly done |
 | 2 | Eval set: harvest the 42 development queries with their must-have facts (user) | none | not started |
 | 3 | Workspace skeleton: crates `engine`, `mcp`, `eval` | none | done (b6cdd83) |
-| 3a | Budget ledger and paid-call gate | **T1**: part A ledger done (b6cdd83); part B paid gate not started | in progress |
+| 3a | Budget ledger and paid-call gate | **T1**: part A ledger done (b6cdd83); part B paid gate done | done |
 | 4 | SearXNG compose (arm64), retriever plus fixtures, then GitHub and Stack Exchange connectors | **T9** quotas and optional keys | not started |
 | 5 | Fetch/extract with safe URL handling, evidence packager v1, MCP quick tool | **T3** URL policy and key scoping; **T4** status rules; **T2** daemon, HTTP access control, TLS check | not started |
 | 6 | Source access policy written in Sources.md and enforced; M1 validation matrix green (offline) | proofs from T2, T3, T4, T9 | not started |

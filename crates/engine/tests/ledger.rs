@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Barrier};
 
-use engine::store::ledger::{Ledger, LedgerError, Reservation, ReservationState};
+use engine::store::ledger::{Ledger, LedgerError, Reservation, ReservationState, SettleReceipt};
 use time::{Date, Month, PrimitiveDateTime, Time};
 
 /// Timestamps are built explicitly in UTC so a local-time period derivation
@@ -219,7 +219,15 @@ fn settle_with_lower_actual_frees_the_difference() {
 
     let now = nov(5, 12);
     let ticket = ledger.reserve("main", "exa", 800, now).unwrap();
-    ledger.settle(ticket, 300, now).unwrap();
+    let settled = ledger.settle(ticket, 300, now).unwrap();
+    // The receipt reports the authoritative recorded charge.
+    assert_eq!(
+        settled,
+        SettleReceipt {
+            recorded_micros: 300,
+            already_settled: false,
+        }
+    );
     assert_eq!(ledger.committed_micros("main", "2026-11").unwrap(), 300);
     assert!(ledger.open_reservations("main").unwrap().is_empty());
 
@@ -242,10 +250,25 @@ fn double_settle_by_id_keeps_the_first_actual() {
     let ticket = ledger.reserve("main", "exa", 400, now).unwrap();
     let id = ticket.id().to_owned();
 
-    ledger.settle_by_id(&id, 100, now).unwrap();
+    let first = ledger.settle_by_id(&id, 100, now).unwrap();
+    assert_eq!(
+        first,
+        SettleReceipt {
+            recorded_micros: 100,
+            already_settled: false,
+        }
+    );
     assert_eq!(ledger.committed_micros("main", "2026-11").unwrap(), 100);
-    // Idempotent: the second settle is Ok but must not count.
-    ledger.settle_by_id(&id, 900, now).unwrap();
+    // Idempotent: the replay is Ok, must not count again, and its receipt
+    // reports the first amount with `already_settled` set.
+    let replay = ledger.settle_by_id(&id, 900, now).unwrap();
+    assert_eq!(
+        replay,
+        SettleReceipt {
+            recorded_micros: 100,
+            already_settled: true,
+        }
+    );
     assert_eq!(ledger.committed_micros("main", "2026-11").unwrap(), 100);
     assert!(ledger.open_reservations("main").unwrap().is_empty());
 }
@@ -270,6 +293,77 @@ fn settle_after_expiry_records_the_actual() {
     ledger.settle_by_id(&id, 120, t0 + 62).unwrap();
     assert_eq!(ledger.committed_micros("main", "2026-11").unwrap(), 120);
     assert!(ledger.open_reservations("main").unwrap().is_empty());
+}
+
+#[test]
+fn reservations_lists_every_row_with_actuals_for_auditing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(dir.path().join("ledger.db")).unwrap();
+    ledger.set_budget("main", 1_000).unwrap();
+
+    let t0 = nov(5, 12);
+    // One row in each state: settled (counts at its actual charge), expired
+    // (estimate) and open (estimate).
+    let settled = ledger.reserve("main", "exa", 300, t0).unwrap();
+    let settled_id = settled.id().to_owned();
+    ledger.settle(settled, 120, t0).unwrap();
+    let expired = ledger.reserve("main", "parallel", 400, t0 + 10).unwrap();
+    let expired_id = expired.id().to_owned();
+    assert_eq!(ledger.expire_open_older_than(5, t0 + 16).unwrap(), 1);
+    let open = ledger.reserve("main", "exa", 200, t0 + 20).unwrap();
+    let open_id = open.id().to_owned();
+
+    // The audit view returns ALL rows ordered by created_at, id.
+    let rows = ledger.reservations("main").unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        [settled_id.as_str(), expired_id.as_str(), open_id.as_str()]
+    );
+    assert_eq!(rows[0].state, ReservationState::Settled);
+    assert_eq!(rows[0].actual_micros, Some(120));
+    assert_eq!(rows[0].provider, "exa");
+    assert_eq!(rows[0].period, "2026-11");
+    assert_eq!(rows[1].state, ReservationState::Expired);
+    assert_eq!(rows[1].actual_micros, None);
+    assert_eq!(rows[1].provider, "parallel");
+    assert_eq!(rows[2].state, ReservationState::Open);
+    assert_eq!(rows[2].actual_micros, None);
+
+    // The outstanding-liability view still hides settled rows.
+    let outstanding = ledger.open_reservations("main").unwrap();
+    assert_eq!(outstanding.len(), 2);
+    assert!(!outstanding.iter().any(|row| row.id == settled_id));
+
+    // Unknown budgets are rejected instead of returning an empty audit log.
+    assert!(matches!(
+        ledger.reservations("ghost").unwrap_err(),
+        LedgerError::UnknownBudget(_)
+    ));
+}
+
+#[test]
+fn reservations_breaks_created_at_ties_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(dir.path().join("ledger.db")).unwrap();
+    ledger.set_budget("main", 1_000).unwrap();
+
+    let t0 = nov(5, 12);
+    let ids: Vec<String> = (0..4)
+        .map(|_| {
+            ledger
+                .reserve("main", "exa", 100, t0)
+                .unwrap()
+                .id()
+                .to_owned()
+        })
+        .collect();
+    let mut expected = ids;
+    expected.sort();
+
+    let rows = ledger.reservations("main").unwrap();
+    let got: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(got, expected);
 }
 
 #[test]
