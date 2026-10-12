@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `docs/ROADMAP.md`: maps milestones M0 to M4 to the M1 build steps and review tasks T1 to T11, with status and the decisions still waiting on the user.
 - Cargo workspace (D2): `engine` library, `wsm-mcp` and `wsm-eval` binaries (placeholders), and `rust-toolchain.toml`. Builds and tests in WSL2.
 - `engine::store::ledger` (task T1 part A, D6/D13): a SQLite budget ledger in integer micro-USD.
   - A reservation is committed in one `BEGIN IMMEDIATE` transaction before its ticket is returned, so concurrent reservations cannot exceed the cap.

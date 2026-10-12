@@ -34,10 +34,13 @@ WSL needs `build-essential` and `pkg-config` (`sudo apt install -y build-essenti
 - `crates/mcp/`: `wsm-mcp` binary (placeholder; it will become the MCP transport).
 - `crates/eval/`: `wsm-eval` harness (placeholder). `mcp` never depends on it.
 
+- `docs/ROADMAP.md`: milestones M0 to M4, the M1 build steps and tasks T1 to T11, with status.
 - `docs/designs/`: approved design docs (gstack office-hours output, with the eng review record appended).
 - `TODOS.md`: deferred work items.
 
 ## Working rules
+
+- Remote: https://github.com/matthew-leee/web-search-mcp (branch `main`).
 
 - Git for every change, and this README and CHANGELOG.md kept current. Commit a meaningful README update before every push; nothing is pushed without approval.
 - Automated tests must not call live search or model APIs; live checks need separate approval and a spending bound.
